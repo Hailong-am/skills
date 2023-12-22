@@ -82,7 +82,9 @@ configurations {
     zipArchive
     all {
         resolutionStrategy {
-            force "org.mockito:mockito-core:5.8.0"
+            force "org.mockito:mockito-core:4.4.0"
+            force "net.bytebuddy:byte-buddy:1.12.8"
+            force "net.bytebuddy:byte-buddy-agent:1.12.8"
             force "com.google.guava:guava:32.1.3-jre" // CVE for 31.1
             force("org.eclipse.platform:org.eclipse.core.runtime:3.30.0") // CVE for < 3.29.0, forces JDK17 for spotless
         }
@@ -108,16 +110,15 @@ dependencies {
     implementation fileTree(dir: sqlJarDirectory, include: ["opensearch-sql-${version}.jar", "ppl-${version}.jar", "protocol-${version}.jar"])
     compileOnly "org.opensearch:common-utils:${version}"
     testImplementation "org.opensearch.test:framework:${opensearch_version}"
-    testImplementation "org.mockito:mockito-core:5.8.0"
-    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.10.1'
-    testImplementation 'org.mockito:mockito-junit-jupiter:5.8.0'
-    testImplementation "com.nhaarman.mockitokotlin2:mockito-kotlin:2.2.0"
     testImplementation "com.cronutils:cron-utils:9.2.1"
     testImplementation "commons-validator:commons-validator:1.8.0"
-    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.10.1'
+    testImplementation "org.opensearch.test:framework:${opensearch_version}"
+    testImplementation "net.bytebuddy:byte-buddy-agent:1.12.8"
+    testImplementation "net.bytebuddy:byte-buddy:1.12.8"
+    testImplementation 'org.mockito:mockito-inline:4.4.0'
 
     // ZipArchive dependencies used for integration tests
-    zipArchive group: 'org.opensearch.plugin', name:'opensearch-ml-plugin', version: "${opensearch_build}"
+//    zipArchive group: 'org.opensearch.plugin', name:'opensearch-ml-plugin', version: "${opensearch_build}"
 }
 
 task extractSqlJar(type: Copy) {
@@ -137,7 +138,6 @@ testingConventions.enabled = false
 thirdPartyAudit.enabled = false
 
 test {
-    useJUnitPlatform()
     include '**/*Tests.class'
     systemProperty 'tests.security.manager', 'false'
     testLogging {
@@ -146,6 +146,41 @@ test {
         showStandardStreams true
     }
 }
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        html.required = true // human readable
+        xml.required = true // for coverlay
+    }
+}
+
+//def jacocoExclusions = []
+//
+//jacocoTestCoverageVerification {
+//    executionData(tasks.withType(Test))
+//    dependsOn jacocoTestReport
+//    violationRules {
+//        rule {
+//            element = 'CLASS'
+//            excludes = jacocoExclusions
+//            limit {
+//                counter = 'BRANCH'
+//                minimum = 0.7  //TODO: change this value to 0.7
+//            }
+//        }
+//        rule {
+//            element = 'CLASS'
+//            excludes = jacocoExclusions
+//            limit {
+//                counter = 'LINE'
+//                value = 'COVEREDRATIO'
+//                minimum = 0.8  //TODO: change this value to 0.8
+//            }
+//        }
+//    }
+//}
+//check.dependsOn jacocoTestCoverageVerification
 
 spotless {
     if (JavaVersion.current() >= JavaVersion.VERSION_17) {

@@ -13,6 +13,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
+import com.carrotsearch.randomizedtesting.annotations.Listeners;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -30,8 +31,9 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.index.IndexNotFoundException;
 import org.opensearch.ml.common.spi.tools.Tool;
+import org.opensearch.test.OpenSearchTestCase;
 
-public class VisualizationsToolTests {
+public class VisualizationsToolTests extends OpenSearchTestCase {
     @Mock
     private Client client;
 
