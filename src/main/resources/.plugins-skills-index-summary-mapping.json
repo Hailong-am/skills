@@ -1,0 +1,13 @@
+{
+  "properties": {
+    "index_name": {
+      "type": "keyword"
+    },
+    "index_description": {
+      "type": "text"
+    },
+    "field_description": {
+      "type": "object"
+    }
+  }
+}

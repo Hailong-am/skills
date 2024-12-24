@@ -10,8 +10,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 
+import org.opensearch.agent.indices.IndicesHelper;
 import org.opensearch.agent.tools.CreateAlertTool;
 import org.opensearch.agent.tools.CreateAnomalyDetectorTool;
+import org.opensearch.agent.tools.IndexSummarizeTool;
 import org.opensearch.agent.tools.LogPatternTool;
 import org.opensearch.agent.tools.NeuralSparseSearchTool;
 import org.opensearch.agent.tools.PPLTool;
@@ -43,6 +45,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension {
     private Client client;
     private ClusterService clusterService;
     private NamedXContentRegistry xContentRegistry;
+    private IndicesHelper indicesHelper;
 
     @SneakyThrows
     @Override
@@ -62,7 +65,9 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension {
         this.client = client;
         this.clusterService = clusterService;
         this.xContentRegistry = xContentRegistry;
+        this.indicesHelper = new IndicesHelper(clusterService, client);
         PPLTool.Factory.getInstance().init(client);
+        IndexSummarizeTool.Factory.getInstance().init(client, indicesHelper);
         NeuralSparseSearchTool.Factory.getInstance().init(client, xContentRegistry);
         VectorDBTool.Factory.getInstance().init(client, xContentRegistry);
         RAGTool.Factory.getInstance().init(client, xContentRegistry);
@@ -81,6 +86,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension {
         return List
             .of(
                 PPLTool.Factory.getInstance(),
+                IndexSummarizeTool.Factory.getInstance(),
                 NeuralSparseSearchTool.Factory.getInstance(),
                 VectorDBTool.Factory.getInstance(),
                 RAGTool.Factory.getInstance(),
