@@ -18,8 +18,8 @@ import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.agent.indices.IndicesHelper;
 import org.opensearch.agent.indices.SkillsIndexEnum;
 import org.opensearch.agent.tools.utils.ToolHelper;
-import org.opensearch.client.Client;
-import org.opensearch.client.Requests;
+import org.opensearch.transport.client.Client;
+import org.opensearch.transport.client.Requests;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.json.JsonXContent;
@@ -64,7 +64,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import static org.opensearch.agent.tools.PPLTool.getPPLTransportActionListener;
+import static org.opensearch.agent.tools.utils.ToolHelper.getPPLTransportActionListener;
 import static org.opensearch.ml.common.utils.StringUtils.gson;
 
 @Log4j2
@@ -93,6 +93,8 @@ public class IndexSummarizeTool implements Tool {
     private IndicesHelper indicesHelper;
 
     private String modelId;
+
+    private Map<String, Object> attributes;
 
     private String contextPrompt;
 
