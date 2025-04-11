@@ -149,7 +149,7 @@ public class IndexSummarizeTool implements Tool {
                         ActionRequest request = new MLPredictionTaskRequest(
                                 modelId,
                                 MLInput.builder().algorithm(FunctionName.REMOTE).inputDataset(inputDataSet).build(),
-                                null
+                                null, null
                         );
                         client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(mlTaskResponse -> {
                                     ModelTensorOutput modelTensorOutput = (ModelTensorOutput) mlTaskResponse.getOutput();

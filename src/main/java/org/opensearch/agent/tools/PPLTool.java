@@ -223,6 +223,7 @@ public class PPLTool implements Tool {
                     ActionRequest request = new MLPredictionTaskRequest(
                             modelId,
                             MLInput.builder().algorithm(FunctionName.REMOTE).inputDataset(inputDataSet).build(),
+                            null,
                             null
                     );
                     client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(mlTaskResponse -> {
