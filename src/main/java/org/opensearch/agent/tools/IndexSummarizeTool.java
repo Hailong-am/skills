@@ -161,6 +161,9 @@ public class IndexSummarizeTool implements Tool {
                                         return;
                                     }
                                     String modelResponse = dataAsMap.get("response");
+                                    log.info("----------------");
+                                    log.info(modelResponse);
+                                    log.info("----------------");
                                     String indexDescription = parseIndexDescription(modelResponse);
                                     Map<String, Object> fieldDescription = parseFieldDescription(modelResponse);
                                     BulkRequest bulkRequest = Requests.bulkRequest();
