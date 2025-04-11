@@ -17,6 +17,7 @@ import static org.mockito.Mockito.verify;
 import static org.opensearch.agent.tools.AbstractRetrieverTool.*;
 import static org.opensearch.agent.tools.AbstractRetrieverToolTests.*;
 import static org.opensearch.agent.tools.VectorDBTool.DEFAULT_K;
+import static org.opensearch.agent.tools.utils.CommonConstants.COMMON_MODEL_ID_FIELD;
 import static org.opensearch.ml.common.utils.StringUtils.gson;
 
 import java.io.IOException;
@@ -30,7 +31,6 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
-import org.opensearch.client.Client;
 import org.opensearch.common.xcontent.json.JsonXContent;
 import org.opensearch.core.ParseField;
 import org.opensearch.core.action.ActionListener;
@@ -45,6 +45,7 @@ import org.opensearch.ml.common.spi.tools.Parser;
 import org.opensearch.ml.common.transport.MLTaskResponse;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
 import org.opensearch.ml.repackage.com.google.common.collect.ImmutableMap;
+import org.opensearch.transport.client.Client;
 
 import lombok.SneakyThrows;
 
@@ -426,7 +427,7 @@ public class RAGToolTests {
         params.put(VectorDBTool.NESTED_PATH_FIELD, TEST_NESTED_PATH);
         RAGTool rAGtool1 = factoryMock.create(params);
         VectorDBTool.Factory.getInstance().init(client, TEST_XCONTENT_REGISTRY_FOR_NEURAL_QUERY);
-        params.put(VectorDBTool.MODEL_ID_FIELD, TEST_EMBEDDING_MODEL_ID);
+        params.put(COMMON_MODEL_ID_FIELD, TEST_EMBEDDING_MODEL_ID);
         VectorDBTool queryTool = VectorDBTool.Factory.getInstance().create(params);
         RAGTool rAGtool2 = new RAGTool(client, TEST_XCONTENT_REGISTRY_FOR_NEURAL_QUERY, TEST_INFERENCE_MODEL_ID, true, queryTool);
 

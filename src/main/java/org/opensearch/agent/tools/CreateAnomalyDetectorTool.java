@@ -5,6 +5,8 @@
 
 package org.opensearch.agent.tools;
 
+import static org.opensearch.agent.tools.utils.CommonConstants.COMMON_MODEL_ID_FIELD;
+import static org.opensearch.ml.common.CommonValue.TENANT_ID_FIELD;
 import static org.opensearch.ml.common.utils.StringUtils.gson;
 
 import java.io.IOException;
@@ -15,6 +17,7 @@ import java.security.PrivilegedExceptionAction;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -28,7 +31,6 @@ import org.apache.commons.text.StringSubstitutor;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest;
 import org.opensearch.agent.tools.utils.ToolHelper;
-import org.opensearch.client.Client;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
@@ -38,10 +40,11 @@ import org.opensearch.ml.common.input.MLInput;
 import org.opensearch.ml.common.output.model.ModelTensor;
 import org.opensearch.ml.common.output.model.ModelTensorOutput;
 import org.opensearch.ml.common.output.model.ModelTensors;
-import org.opensearch.ml.common.spi.tools.Tool;
 import org.opensearch.ml.common.spi.tools.ToolAnnotation;
+import org.opensearch.ml.common.spi.tools.WithModelTool;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskRequest;
+import org.opensearch.transport.client.Client;
 
 import com.google.common.collect.ImmutableMap;
 
@@ -65,7 +68,7 @@ import lombok.extern.log4j.Log4j2;
 @Setter
 @Getter
 @ToolAnnotation(CreateAnomalyDetectorTool.TYPE)
-public class CreateAnomalyDetectorTool implements Tool {
+public class CreateAnomalyDetectorTool implements WithModelTool {
     // the type of this tool
     public static final String TYPE = "CreateAnomalyDetectorTool";
 
@@ -165,6 +168,7 @@ public class CreateAnomalyDetectorTool implements Tool {
      */
     @Override
     public <T> void run(Map<String, String> parameters, ActionListener<T> listener) {
+        final String tenantId = parameters.get(TENANT_ID_FIELD);
         Map<String, String> enrichedParameters = enrichParameters(parameters);
         String indexName = enrichedParameters.get("index");
         if (Strings.isNullOrEmpty(indexName)) {
@@ -228,7 +232,8 @@ public class CreateAnomalyDetectorTool implements Tool {
             ActionRequest request = new MLPredictionTaskRequest(
                 modelId,
                 MLInput.builder().algorithm(FunctionName.REMOTE).inputDataset(inputDataSet).build(),
-                null
+                null,
+                tenantId
             );
 
             client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(mlTaskResponse -> {
@@ -392,7 +397,7 @@ public class CreateAnomalyDetectorTool implements Tool {
     /**
      * The tool factory
      */
-    public static class Factory implements Tool.Factory<CreateAnomalyDetectorTool> {
+    public static class Factory implements WithModelTool.Factory<CreateAnomalyDetectorTool> {
         private Client client;
 
         private static CreateAnomalyDetectorTool.Factory INSTANCE;
@@ -424,7 +429,7 @@ public class CreateAnomalyDetectorTool implements Tool {
          */
         @Override
         public CreateAnomalyDetectorTool create(Map<String, Object> map) {
-            String modelId = (String) map.getOrDefault("model_id", "");
+            String modelId = (String) map.getOrDefault(COMMON_MODEL_ID_FIELD, "");
             if (modelId.isEmpty()) {
                 throw new IllegalArgumentException("model_id cannot be empty.");
             }
@@ -453,6 +458,11 @@ public class CreateAnomalyDetectorTool implements Tool {
         @Override
         public String getDefaultVersion() {
             return null;
+        }
+
+        @Override
+        public List<String> getAllModelKeys() {
+            return List.of(COMMON_MODEL_ID_FIELD);
         }
     }
 }
