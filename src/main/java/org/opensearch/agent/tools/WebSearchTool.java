@@ -5,9 +5,9 @@
 
 package org.opensearch.agent.tools;
 
+import static org.opensearch.ml.common.CommonValue.TOOL_INPUT_SCHEMA_FIELD;
+
 import java.io.IOException;
-import java.security.AccessController;
-import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -39,6 +39,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.jayway.jsonpath.JsonPath;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -52,11 +53,29 @@ public class WebSearchTool implements Tool {
 
     public static final String TYPE = "WebSearchTool";
 
-    private static final String DEFAULT_DESCRIPTION = "A generic web search tool that supports multiple search engines and endpoints. "
-        + "Parameters: {\"query\": \"search terms\", \"engine\": \"google|duckduckgo|bing\", "
-        + "\"endpoint\": \"API endpoint\", \"next_page\": \"search result next page link\"}";
+    public static final String DEFAULT_DESCRIPTION =
+        "This tool performs a web search using the specified query or fetches the next page of a previous search. "
+            + "It accepts one mandatory argument: `query`, which is a search term used to initiate a new search, "
+            + "and one optional argument: `next_page`, which is a link to retrieve the next set of search results from a previous response. "
+            + "The tool returns the raw documents retrieved from the search engine, along with a `next_page` field for pagination.";
 
     private static final String USER_AGENT = "OpenSearchWebCrawler/1.0";
+    public static final String DEFAULT_INPUT_SCHEMA = "{"
+        + "\"type\":\"object\","
+        + "\"properties\":{"
+        + "\"query\":{"
+        + "\"type\":\"string\","
+        + "\"description\":\"The search term to query using the configured search engine. This is the primary input used to perform the search.\""
+        + "},"
+        + "\"next_page\":{"
+        + "\"type\":\"string\","
+        + "\"description\":\"URL to the next page of search results. If provided, the tool will fetch and return results from this page instead of executing a new search query.\""
+        + "}"
+        + "},"
+        + "\"required\":[\"query\"]"
+        + "}";
+
+    public static final Map<String, Object> DEFAULT_ATTRIBUTES = Map.of(TOOL_INPUT_SCHEMA_FIELD, DEFAULT_INPUT_SCHEMA, "strict", false);
 
     @Setter
     @Getter
@@ -74,32 +93,39 @@ public class WebSearchTool implements Tool {
     public WebSearchTool(ThreadPool threadPool) {
         this.httpClient = HttpClients.createDefault();
         this.threadPool = threadPool;
+        this.attributes = new HashMap<>();
+        attributes.put(TOOL_INPUT_SCHEMA_FIELD, DEFAULT_INPUT_SCHEMA);
+        attributes.put("strict", false);
     }
 
     @Override
     public <T> void run(Map<String, String> parameters, ActionListener<T> listener) {
-        // common search parameters
-        String query = parameters.getOrDefault("query", parameters.get("question")).replaceAll(" ", "+");
-        String engine = parameters.getOrDefault("engine", "google");
-        String endpoint = parameters.getOrDefault("endpoint", getDefaultEndpoint(engine));
-        String apiKey = parameters.getOrDefault("api_key", null);
-        String nextPage = parameters.getOrDefault("next_page", null);
+        try {
+            // common search parameters
+            String query = parameters.getOrDefault("query", parameters.get("question")).replaceAll(" ", "+");
+            String engine = parameters.getOrDefault("engine", "google");
+            String endpoint = parameters.getOrDefault("endpoint", getDefaultEndpoint(engine));
+            String apiKey = parameters.get("api_key");
+            String nextPage = parameters.get("next_page");
 
-        // Token information of the target link to crawl
-        String token = parameters.getOrDefault("token", null);
+            // Google search parameters
+            String engineId = parameters.get("engine_id");
 
-        // Google search parameters
-        String engineId = parameters.getOrDefault("engine_id", null);
-        threadPool.executor(ToolPlugin.WEBSEARCH_CRAWLER_THREADPOOL).submit(() -> {
-            try {
-                AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
+            // Custom search parameters
+            String authorization = parameters.get("Authorization");
+            String queryKey = parameters.getOrDefault("query_key", "q");
+            String offsetKey = parameters.getOrDefault("offset_key", "offset");
+            String limitKey = parameters.getOrDefault("limit_key", "limit");
+            String customResUrlJsonpath = parameters.get("custom_res_url_jsonpath");
+            threadPool.executor(ToolPlugin.WEBSEARCH_CRAWLER_THREADPOOL).submit(() -> {
+                try {
                     String parsedNextPage = null;
                     if ("duckduckgo".equalsIgnoreCase(engine)) {
                         // duckduckgo has different approach to other APIs as it's not a standard public API.
                         if (nextPage != null) {
-                            fetchDuckDuckGoResult(nextPage, token, listener);
+                            fetchDuckDuckGoResult(nextPage, listener);
                         } else {
-                            fetchDuckDuckGoResult(buildDDGEndpoint(getDefaultEndpoint(engine), query), token, listener);
+                            fetchDuckDuckGoResult(buildDDGEndpoint(getDefaultEndpoint(engine), query), listener);
                         }
                     } else {
                         HttpGet getRequest = null;
@@ -120,9 +146,19 @@ public class WebSearchTool implements Tool {
                                 parsedNextPage = buildBingUrl(endpoint, query, 10);
                             }
                             getRequest.addHeader("Ocp-Apim-Subscription-Key", apiKey);
+                        } else if ("custom".equalsIgnoreCase(engine)) {
+                            if (nextPage != null) {
+                                getRequest = new HttpGet(nextPage);
+                                parsedNextPage = buildCustomNextPage(endpoint, nextPage, queryKey, query, offsetKey, limitKey);
+                            } else {
+                                getRequest = new HttpGet(buildCustomUrl(endpoint, queryKey, query, offsetKey, 0, limitKey));
+                                parsedNextPage = buildCustomUrl(endpoint, queryKey, query, offsetKey, 10, limitKey);
+                            }
+                            getRequest.addHeader("Authorization", authorization);
                         } else {
                             // Search engine not supported.
                             listener.onFailure(new IllegalArgumentException("Unsupported search engine: %s".formatted(engine)));
+                            return;
                         }
                         CloseableHttpResponse res = httpClient.execute(getRequest);
                         if (res.getCode() >= HttpStatus.SC_BAD_REQUEST) {
@@ -132,15 +168,16 @@ public class WebSearchTool implements Tool {
                                 );
                         } else {
                             String responseString = EntityUtils.toString(res.getEntity());
-                            parseResponse(responseString, parsedNextPage, token, engine, listener);
+                            parseResponse(responseString, authorization, parsedNextPage, engine, customResUrlJsonpath, listener);
                         }
                     }
-                    return null;
-                });
-            } catch (Exception e) {
-                listener.onFailure(new IllegalStateException("Web search failed: %s".formatted(e.getMessage())));
-            }
-        });
+                } catch (Exception e) {
+                    listener.onFailure(new IllegalStateException("Web search failed: %s".formatted(e.getMessage())));
+                }
+            });
+        } catch (Exception e) {
+            listener.onFailure(new IllegalStateException("Web search failed: %s".formatted(e.getMessage())));
+        }
     }
 
     private String buildDDGEndpoint(String endpoint, String query) {
@@ -163,11 +200,29 @@ public class WebSearchTool implements Tool {
         return buildBingUrl(endpoint, query, offset);
     }
 
+    private String buildCustomNextPage(
+        String endpoint,
+        String currentPage,
+        String queryKey,
+        String query,
+        String offsetKey,
+        String limitKey
+    ) {
+        String[] pageSplit = currentPage.split("&%s=".formatted(offsetKey));
+        int offsetValue = NumberUtils.toInt(pageSplit[1].split("&")[0], 0) + 10;
+        return buildCustomUrl(endpoint, queryKey, query, offsetKey, offsetValue, limitKey);
+    }
+
+    private String buildCustomUrl(String endpoint, String queryKey, String query, String offsetKey, int offsetValue, String limitKey) {
+        return "%s?%s=%s&%s=%d&%s=10".formatted(endpoint, queryKey, query, offsetKey, offsetValue, limitKey);
+    }
+
     private String getDefaultEndpoint(String engine) {
         return switch (engine.toLowerCase(Locale.ROOT)) {
             case "google" -> "https://customsearch.googleapis.com/customsearch/v1";
             case "bing" -> "https://api.bing.microsoft.com/v7.0/search";
             case "duckduckgo" -> "https://duckduckgo.com/html";
+            case "custom" -> null;
             default -> throw new IllegalArgumentException("Unsupported search engine: %s".formatted(engine));
         };
     }
@@ -177,20 +232,32 @@ public class WebSearchTool implements Tool {
         return "%s?q%s&textFormat=HTML&count=10&offset=%d".formatted(endpoint, query, offset);
     }
 
-    private <T> void parseResponse(String rawResponse, String nextPage, String token, String engine, ActionListener<T> listener) {
+    private <T> void parseResponse(
+        String rawResponse,
+        String authorization,
+        String nextPage,
+        String engine,
+        String customResUrlJsonpath,
+        ActionListener<T> listener
+    ) {
         JsonObject rawJson = JsonParser.parseString(rawResponse).getAsJsonObject();
         switch (engine.toLowerCase(Locale.ROOT)) {
             case "google":
-                parseGoogleResults(rawJson, nextPage, token, listener);
+                parseGoogleResults(rawJson, nextPage, listener);
                 break;
             case "bing":
-                parseBingResults(rawJson, nextPage, token, listener);
+                parseBingResults(rawJson, nextPage, listener);
+                break;
+            case "custom":
+                List<String> urls = JsonPath.read(rawResponse, customResUrlJsonpath);
+                parseCustomResults(urls, authorization, nextPage, listener);
+                break;
             default:
                 listener.onFailure(new RuntimeException("Unsupported search engine: %s".formatted(engine)));
         }
     }
 
-    private <T> void parseGoogleResults(JsonObject googleResponse, String nextPage, String token, ActionListener<T> listener) {
+    private <T> void parseGoogleResults(JsonObject googleResponse, String nextPage, ActionListener<T> listener) {
         Map<String, Object> results = new HashMap<>();
         results.put("next_page", nextPage);
         // extract search results, each item is a search result:
@@ -202,14 +269,14 @@ public class WebSearchTool implements Tool {
             // extract the actual link for scrawl.
             String link = item.get("link").getAsString();
             // extract title and content.
-            Map<String, String> crawlResult = crawlPage(link, token);
+            Map<String, String> crawlResult = crawlPage(link, null);
             crawlResults.add(crawlResult);
         }
         results.put("items", crawlResults);
         listener.onResponse((T) StringUtils.gson.toJson(results));
     }
 
-    private <T> void parseBingResults(JsonObject bingResponse, String nextPage, String token, ActionListener<T> listener) {
+    private <T> void parseBingResults(JsonObject bingResponse, String nextPage, ActionListener<T> listener) {
         Map<String, Object> results = new HashMap<>();
         results.put("next_page", nextPage);
         List<Map<String, String>> crawlResults = new ArrayList<>();
@@ -217,14 +284,27 @@ public class WebSearchTool implements Tool {
         for (int i = 0; i < values.size(); i++) {
             JsonObject value = values.get(i).getAsJsonObject();
             String link = value.get("url").getAsString();
-            Map<String, String> crawlResult = crawlPage(link, token);
+            Map<String, String> crawlResult = crawlPage(link, null);
             crawlResults.add(crawlResult);
         }
         results.put("items", crawlResults);
         listener.onResponse((T) StringUtils.gson.toJson(results));
     }
 
-    private <T> void fetchDuckDuckGoResult(String endpoint, String token, ActionListener<T> listener) {
+    private <T> void parseCustomResults(List<String> urls, String authorization, String nextPage, ActionListener<T> listener) {
+        Map<String, Object> results = new HashMap<>();
+        results.put("next_page", nextPage);
+        List<Map<String, String>> crawlResults = new ArrayList<>();
+        for (int i = 0; i < urls.size(); i++) {
+            String link = urls.get(i);
+            Map<String, String> crawlResult = crawlPage(link, authorization);
+            crawlResults.add(crawlResult);
+        }
+        results.put("items", crawlResults);
+        listener.onResponse((T) StringUtils.gson.toJson(results));
+    }
+
+    private <T> void fetchDuckDuckGoResult(String endpoint, ActionListener<T> listener) {
         try {
             Document doc = Jsoup.connect(endpoint).timeout(10000).get();
             Optional<Elements> pageResult = Optional
@@ -250,7 +330,7 @@ public class WebSearchTool implements Tool {
                     return;
                 }
                 String link = elementOptional.get().attr("href");
-                Map<String, String> crawlResult = crawlPage(link, token);
+                Map<String, String> crawlResult = crawlPage(link, null);
                 crawlResults.add(crawlResult);
             }
             results.put("next_page", nextPage);
@@ -301,11 +381,11 @@ public class WebSearchTool implements Tool {
      *
      * @param url The url to crawl
      */
-    private Map<String, String> crawlPage(String url, String token) {
+    private Map<String, String> crawlPage(String url, String authorization) {
         try {
             Connection connection = Jsoup.connect(url).timeout(10000).userAgent(USER_AGENT);
-            if (token != null && !token.isEmpty()) {
-                connection.header("Authorization", "Bearer %s".formatted(token));
+            if (authorization != null) {
+                connection.header("Authorization", authorization);
             }
             Document doc = connection.get();
             Elements parentElements = doc.select("body");
@@ -346,24 +426,56 @@ public class WebSearchTool implements Tool {
     @Override
     public boolean validate(Map<String, String> parameters) {
         String engine = parameters.get("engine");
-        boolean hasNextPage = parameters.containsKey("next_page") && !parameters.get("next_page").isEmpty();
-        boolean hasQuery = parameters.containsKey("query") && !parameters.get("query").isEmpty();
-        boolean hasEndpoint = parameters.containsKey("endpoint") && !parameters.get("endpoint").isEmpty();
+        if (org.apache.commons.lang3.StringUtils.isEmpty(engine)) {
+            return false;
+        }
+
+        boolean isQueryEmpty = org.apache.commons.lang3.StringUtils.isEmpty(parameters.getOrDefault("query", parameters.get("question")));
+        if (isQueryEmpty) {
+            log.warn("Query is empty");
+            return false;
+        }
+
+        boolean isEndpointEmpty = org.apache.commons.lang3.StringUtils
+            .isEmpty(parameters.getOrDefault("endpoint", getDefaultEndpoint(engine)));
+        if (isEndpointEmpty) {
+            log.warn("Endpoint is empty");
+            return false;
+        }
+
         if ("google".equalsIgnoreCase(engine)) {
             boolean hasEngineIdAndApiKey = parameters.containsKey("engine_id")
                 && !parameters.get("engine_id").isEmpty()
                 && parameters.containsKey("api_key")
                 && !parameters.get("api_key").isEmpty();
-            return (hasEndpoint && hasQuery && hasEngineIdAndApiKey) || hasNextPage;
+            if (!hasEngineIdAndApiKey) {
+                log.warn("Google search engine_id or api_key is empty");
+                return false;
+            }
+            return true;
         } else if ("duckduckgo".equalsIgnoreCase(engine)) {
-            return hasQuery || hasNextPage;
+            return true;
         } else if ("bing".equalsIgnoreCase(engine)) {
-            boolean hasApiKey = parameters.containsKey("api_key") && !parameters.get("api_key").isEmpty();
-            return (hasEndpoint && hasApiKey) || hasNextPage;
-        } else {
-            log.error("Unsupported search engine: {}", engine);
-            return false;
+            boolean hasApiKey = org.apache.commons.lang3.StringUtils.isEmpty(parameters.get("api_key"));
+            if (!hasApiKey) {
+                log.warn("Bing search api_key is empty");
+                return false;
+            }
+            return true;
+        } else if ("custom".equalsIgnoreCase(engine)) {
+            String customApi = parameters.get("custom_api");
+            String customResUrlJsonpath = parameters.get("custom_res_url_jsonpath");
+            if (org.apache.commons.lang3.StringUtils.isEmpty(customApi)
+                || org.apache.commons.lang3.StringUtils.isEmpty(customResUrlJsonpath)) {
+                log.warn("custom search API is empty or result json path is empty");
+                return false;
+            }
+
+            return true;
         }
+
+        log.error("Unsupported search engine: {}", engine);
+        return false;
     }
 
     public static class Factory implements Tool.Factory<WebSearchTool> {
@@ -387,14 +499,7 @@ public class WebSearchTool implements Tool {
 
         @Override
         public WebSearchTool create(Map<String, Object> map) {
-            validateParameters(map);
             return new WebSearchTool(threadPool);
-        }
-
-        private void validateParameters(Map<String, Object> map) {
-            if (!map.containsKey("engine")) {
-                throw new IllegalArgumentException("WebSearchTool requires 'engine' parameter");
-            }
         }
 
         @Override
@@ -410,6 +515,11 @@ public class WebSearchTool implements Tool {
         @Override
         public String getDefaultVersion() {
             return "1.0";
+        }
+
+        @Override
+        public Map<String, Object> getDefaultAttributes() {
+            return DEFAULT_ATTRIBUTES;
         }
     }
 }

@@ -210,14 +210,14 @@ public class PPLTool implements WithModelTool {
         if (indexName.startsWith(".")) {
             throw new IllegalArgumentException(
                     "PPLTool doesn't support searching indices starting with '.' since it could be system index, current searching index name: "
-                            + indexName
+                    + indexName
             );
         }
         ActionListener<String> actionsAfterTableinfo = ActionListener.wrap(tableInfo -> {
                     String prompt = constructPrompt(tableInfo, question.strip(), indexName);
                     RemoteInferenceInputDataSet inputDataSet = RemoteInferenceInputDataSet
                             .builder()
-                            .parameters(Collections.singletonMap("prompt", prompt))
+                            .parameters(Map.of("prompt", prompt, "datasourceType", parameters.getOrDefault("type", "Opensearch")))
                             .build();
                     ActionRequest request = new MLPredictionTaskRequest(
                             modelId,
@@ -272,8 +272,8 @@ public class PPLTool implements WithModelTool {
 
         );
         if (parameters.containsKey("schema")
-                && parameters.containsKey("samples")
-                && Objects.equals(parameters.getOrDefault("type", ""), "s3")) {
+            && parameters.containsKey("samples")
+            && Objects.equals(parameters.getOrDefault("type", ""), "s3")) {
             Map<String, Object> schema = gson.fromJson(parameters.get("schema"), Map.class);
             List<Object> samples = gson.fromJson(parameters.get("samples"), List.class);
             try {
