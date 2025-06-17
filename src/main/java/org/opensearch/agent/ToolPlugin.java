@@ -10,7 +10,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 
+import lombok.extern.java.Log;
+import lombok.extern.log4j.Log4j2;
 import org.opensearch.agent.indices.IndicesHelper;
+import org.opensearch.agent.indices.SkillsIndexEnum;
 import org.opensearch.agent.tools.CreateAlertTool;
 import org.opensearch.agent.tools.CreateAnomalyDetectorTool;
 import org.opensearch.agent.tools.IndexSummarizeTool;
@@ -28,6 +31,7 @@ import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
@@ -42,11 +46,12 @@ import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
+import org.opensearch.agent.indices.IndicesHelper;
 
 import com.google.common.collect.ImmutableList;
 
 import lombok.SneakyThrows;
-
+@Log4j2
 public class ToolPlugin extends Plugin implements MLCommonsExtension {
 
     private Client client;
@@ -76,7 +81,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension {
         this.clusterService = clusterService;
         this.xContentRegistry = xContentRegistry;
         this.indicesHelper = new IndicesHelper(clusterService, client);
-        PPLTool.Factory.getInstance().init(client);
+        PPLTool.Factory.getInstance().init(client, indicesHelper);
         IndexSummarizeTool.Factory.getInstance().init(client, indicesHelper);
         NeuralSparseSearchTool.Factory.getInstance().init(client, xContentRegistry);
         VectorDBTool.Factory.getInstance().init(client, xContentRegistry);

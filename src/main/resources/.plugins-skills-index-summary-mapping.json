@@ -7,7 +7,7 @@
       "type": "text"
     },
     "field_description": {
-      "type": "object"
+      "type": "text"
     }
   }
 }

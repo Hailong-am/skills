@@ -383,6 +383,13 @@ public class IndexSummarizeTool implements Tool {
         public void init(Client client, IndicesHelper indicesHelper) {
             this.client = client;
             this.indicesHelper = indicesHelper;
+            this.indicesHelper.initIndexIfAbsent(SkillsIndexEnum.SKILLS_INDEX_SUMMARY, ActionListener.wrap(
+                    created -> {
+                        log.info("create system successfully");
+                    }, e -> {
+                        log.error("fail to create skills indices due to:" + e.getMessage());
+                    }
+            ));
         }
 
         @Override

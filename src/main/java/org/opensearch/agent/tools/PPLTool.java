@@ -35,11 +35,15 @@ import org.json.JSONObject;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.agent.indices.IndicesHelper;
+import org.opensearch.agent.indices.SkillsIndexEnum;
 import org.opensearch.agent.tools.utils.ToolHelper;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.ml.common.FunctionName;
 import org.opensearch.ml.common.dataset.remote.RemoteInferenceInputDataSet;
 import org.opensearch.ml.common.input.MLInput;
@@ -75,6 +79,9 @@ public class PPLTool implements WithModelTool {
 
     @Setter
     private Client client;
+
+    @Setter
+    private IndicesHelper indicesHelper;
 
     private static final String DEFAULT_DESCRIPTION =
             "\"Use this tool when user ask question based on the data in the cluster or parse user statement about which index to use in a conversion.\nAlso use this tool when question only contains index information.\n1. If uesr question contain both question and index name, the input parameters are {'question': UserQuestion, 'index': IndexName}.\n2. If user question contain only question, the input parameter is {'question': UserQuestion}.\n3. If uesr question contain only index name, find the original human input from the conversation histroy and formulate parameter as {'question': UserQuestion, 'index': IndexName}\nThe index name should be exactly as stated in user's input.";
@@ -299,8 +306,21 @@ public class PPLTool implements WithModelTool {
             SearchRequest searchRequest = buildSearchRequest(firstIndexName);
             client.search(searchRequest, ActionListener.wrap(searchResponse -> {
                 SearchHit[] searchHits = searchResponse.getHits().getHits();
-                String tableInfo = constructTableInfo(searchHits, mappings);
-                actionsAfterTableinfo.onResponse(tableInfo);
+                client.search(buildDescriptionSearchRequest(indexName), ActionListener.wrap(
+                        descriptionResponse -> {
+                            String tableInfo = constructTableInfo(searchHits, mappings, parseMap(descriptionResponse));
+                            actionsAfterTableinfo.onResponse(tableInfo);
+                        }, e -> {
+                            log.error("fail to get description");
+                            String tableInfo = null;
+                            try {
+                                tableInfo = constructTableInfo(searchHits, mappings, Map.of());
+                            } catch (PrivilegedActionException ex) {
+                                listener.onFailure(ex);
+                            }
+                            actionsAfterTableinfo.onResponse(tableInfo);
+                        }
+                ));
             }, e -> {
                 log.error(String.format(Locale.ROOT, "fail to search model: %s with error: %s", modelId, e.getMessage()), e);
                 listener.onFailure(e);
@@ -338,6 +358,7 @@ public class PPLTool implements WithModelTool {
 
     public static class Factory implements WithModelTool.Factory<PPLTool> {
         private Client client;
+        private IndicesHelper indicesHelper;
 
         private static Factory INSTANCE;
 
@@ -354,13 +375,23 @@ public class PPLTool implements WithModelTool {
             }
         }
 
-        public void init(Client client) {
+        public void init(Client client, IndicesHelper indicesHelper) {
             this.client = client;
+            this.indicesHelper = indicesHelper;
         }
 
         @Override
         public PPLTool create(Map<String, Object> map) {
             validatePPLToolParameters(map);
+
+            this.indicesHelper.initIndexIfAbsent(SkillsIndexEnum.SKILLS_INDEX_SUMMARY, ActionListener.wrap(
+                    created -> {
+                        log.info("create system successfully");
+                    }, e -> {
+                        log.error("fail to create skills indices due to:" + e.getMessage());
+                    }
+            ));
+
             return new PPLTool(
                     client,
                     (String) map.get(COMMON_MODEL_ID_FIELD),
@@ -398,6 +429,13 @@ public class PPLTool implements WithModelTool {
         searchSourceBuilder.size(1).query(new MatchAllQueryBuilder());
         // client;
         return new SearchRequest(new String[] { indexName }, searchSourceBuilder);
+    }
+
+    private SearchRequest buildDescriptionSearchRequest(String indexName) {
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.size(1).query(new TermQueryBuilder("index_name", indexName));
+        // client;
+        return new SearchRequest(new String[] { SkillsIndexEnum.SKILLS_INDEX_SUMMARY.getIndexName() }, searchSourceBuilder);
     }
 
     private GetMappingsRequest buildGetMappingRequest(String indexName) {
@@ -504,7 +542,7 @@ public class PPLTool implements WithModelTool {
 
     }
 
-    private String constructTableInfo(SearchHit[] searchHits, Map<String, MappingMetadata> mappings) throws PrivilegedActionException {
+    private String constructTableInfo(SearchHit[] searchHits, Map<String, MappingMetadata> mappings, Map<String, Object> description) throws PrivilegedActionException {
         String firstIndexName = (String) mappings.keySet().toArray()[0];
         MappingMetadata mappingMetadata = mappings.get(firstIndexName);
         Map<String, Object> mappingSource = (Map<String, Object>) mappingMetadata.getSourceAsMap().get("properties");
@@ -531,6 +569,9 @@ public class PPLTool implements WithModelTool {
             for (String key : sortedKeys) {
                 if (ALLOWED_FIELDS_TYPE.contains(fieldsToType.get(key))) {
                     String line = "- " + key + ": " + fieldsToType.get(key) + " (" + fieldsToSample.get(key) + ")";
+                    if (description.containsKey(key)) {
+                        line += " [" + description.get(key).toString() + "]";
+                    }
                     tableInfoJoiner.add(line);
                 }
             }
@@ -538,12 +579,22 @@ public class PPLTool implements WithModelTool {
             for (String key : sortedKeys) {
                 if (ALLOWED_FIELDS_TYPE.contains(fieldsToType.get(key))) {
                     String line = "- " + key + ": " + fieldsToType.get(key);
+                    if (description.containsKey(key)) {
+                        line += " [" + description.get(key).toString() + "]";
+                    }
                     tableInfoJoiner.add(line);
                 }
             }
         }
 
         return tableInfoJoiner.toString();
+    }
+
+    private Map<String, Object> parseMap(SearchResponse descriptionResponse) {
+        SearchHit[] hits = descriptionResponse.getHits().getHits();
+        SearchHit hit = hits[0];
+        Map<String, Object> map = gson.fromJson((String) hit.getSourceAsMap().get("field_description"), Map.class);
+        return map;
     }
 
     private String constructPrompt(String tableInfo, String question, String indexName) {

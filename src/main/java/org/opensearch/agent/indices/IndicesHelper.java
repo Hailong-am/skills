@@ -63,7 +63,7 @@ public class IndicesHelper {
             String mapping = new String(Objects.requireNonNull(mappingIns).readAllBytes(), StandardCharsets.UTF_8);
             ActionListener<Boolean> internalListener = ActionListener.runBefore(listener, threadContext::restore);
 
-            if (!clusterService.state().metadata().hasIndex(skillsIndexEnum.getIndexName())) {
+            if (Objects.isNull(clusterService.state()) || !clusterService.state().metadata().hasIndex(skillsIndexEnum.getIndexName())) {
                 ActionListener<CreateIndexResponse> actionListener = ActionListener.wrap(r -> {
                     if (r.isAcknowledged()) {
                         log.info("create index:{}", skillsIndexEnum.getIndexName());
