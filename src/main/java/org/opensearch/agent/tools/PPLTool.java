@@ -35,11 +35,15 @@ import org.json.JSONObject;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest;
 import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.agent.indices.IndicesHelper;
+import org.opensearch.agent.indices.SkillsIndexEnum;
 import org.opensearch.agent.tools.utils.ToolHelper;
 import org.opensearch.cluster.metadata.MappingMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.index.query.MatchAllQueryBuilder;
+import org.opensearch.index.query.TermQueryBuilder;
 import org.opensearch.ml.common.FunctionName;
 import org.opensearch.ml.common.dataset.remote.RemoteInferenceInputDataSet;
 import org.opensearch.ml.common.input.MLInput;
@@ -76,8 +80,11 @@ public class PPLTool implements WithModelTool {
     @Setter
     private Client client;
 
+    @Setter
+    private IndicesHelper indicesHelper;
+
     private static final String DEFAULT_DESCRIPTION =
-        "\"Use this tool when user ask question based on the data in the cluster or parse user statement about which index to use in a conversion.\nAlso use this tool when question only contains index information.\n1. If uesr question contain both question and index name, the input parameters are {'question': UserQuestion, 'index': IndexName}.\n2. If user question contain only question, the input parameter is {'question': UserQuestion}.\n3. If uesr question contain only index name, find the original human input from the conversation histroy and formulate parameter as {'question': UserQuestion, 'index': IndexName}\nThe index name should be exactly as stated in user's input.";
+            "\"Use this tool when user ask question based on the data in the cluster or parse user statement about which index to use in a conversion.\nAlso use this tool when question only contains index information.\n1. If uesr question contain both question and index name, the input parameters are {'question': UserQuestion, 'index': IndexName}.\n2. If user question contain only question, the input parameter is {'question': UserQuestion}.\n3. If uesr question contain only index name, find the original human input from the conversation histroy and formulate parameter as {'question': UserQuestion, 'index': IndexName}\nThe index name should be exactly as stated in user's input.";
 
     @Setter
     private String name = TYPE;
@@ -171,13 +178,13 @@ public class PPLTool implements WithModelTool {
     }
 
     public PPLTool(
-        Client client,
-        String modelId,
-        String contextPrompt,
-        String pplModelType,
-        String previousToolKey,
-        int head,
-        boolean execute
+            Client client,
+            String modelId,
+            String contextPrompt,
+            String pplModelType,
+            String previousToolKey,
+            int head,
+            boolean execute
     ) {
         this.client = client;
         this.modelId = modelId;
@@ -200,7 +207,7 @@ public class PPLTool implements WithModelTool {
         String indexName = getIndexNameFromParameters(parameters);
         if (StringUtils.isBlank(indexName)) {
             throw new IllegalArgumentException(
-                "Return this final answer to human directly and do not use other tools: 'Please provide index name'. Please try to directly send this message to human to ask for index name"
+                    "Return this final answer to human directly and do not use other tools: 'Please provide index name'. Please try to directly send this message to human to ask for index name"
             );
         }
         String question = parameters.get("question");
@@ -209,66 +216,66 @@ public class PPLTool implements WithModelTool {
         }
         if (indexName.startsWith(".")) {
             throw new IllegalArgumentException(
-                "PPLTool doesn't support searching indices starting with '.' since it could be system index, current searching index name: "
+                    "PPLTool doesn't support searching indices starting with '.' since it could be system index, current searching index name: "
                     + indexName
             );
         }
         ActionListener<String> actionsAfterTableinfo = ActionListener.wrap(tableInfo -> {
-            String prompt = constructPrompt(tableInfo, question.strip(), indexName);
-            RemoteInferenceInputDataSet inputDataSet = RemoteInferenceInputDataSet
-                .builder()
-                .parameters(Map.of("prompt", prompt, "datasourceType", parameters.getOrDefault("type", "Opensearch")))
-                .build();
-            ActionRequest request = new MLPredictionTaskRequest(
-                modelId,
-                MLInput.builder().algorithm(FunctionName.REMOTE).inputDataset(inputDataSet).build(),
-                null,
-                tenantId
-            );
-            client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(mlTaskResponse -> {
-                ModelTensorOutput modelTensorOutput = (ModelTensorOutput) mlTaskResponse.getOutput();
-                ModelTensors modelTensors = modelTensorOutput.getMlModelOutputs().get(0);
-                ModelTensor modelTensor = modelTensors.getMlModelTensors().get(0);
-                Map<String, String> dataAsMap = (Map<String, String>) modelTensor.getDataAsMap();
-                if (dataAsMap.get("response") == null) {
-                    listener.onFailure(new IllegalStateException("Remote endpoint fails to inference."));
-                    return;
-                }
-                String ppl = parseOutput(dataAsMap.get("response"), indexName);
-                if (!this.execute) {
-                    Map<String, String> ret = ImmutableMap.of("ppl", ppl);
-                    listener.onResponse((T) AccessController.doPrivileged((PrivilegedExceptionAction<String>) () -> gson.toJson(ret)));
-                    return;
-                }
-                JSONObject jsonContent = new JSONObject(ImmutableMap.of("query", ppl));
-                PPLQueryRequest pplQueryRequest = new PPLQueryRequest(ppl, jsonContent, null, "jdbc");
-                TransportPPLQueryRequest transportPPLQueryRequest = new TransportPPLQueryRequest(pplQueryRequest);
-                client
-                    .execute(
-                        PPLQueryAction.INSTANCE,
-                        transportPPLQueryRequest,
-                        getPPLTransportActionListener(ActionListener.wrap(transportPPLQueryResponse -> {
-                            String results = transportPPLQueryResponse.getResult();
-                            Map<String, String> returnResults = ImmutableMap.of("ppl", ppl, "executionResult", results);
-                            listener
-                                .onResponse(
-                                    (T) AccessController.doPrivileged((PrivilegedExceptionAction<String>) () -> gson.toJson(returnResults))
-                                );
-                        }, e -> {
-                            String pplError = "execute ppl:" + ppl + ", get error: " + e.getMessage();
-                            Exception exception = new Exception(pplError, e);
-                            listener.onFailure(exception);
-                        }))
+                    String prompt = constructPrompt(tableInfo, question.strip(), indexName);
+                    RemoteInferenceInputDataSet inputDataSet = RemoteInferenceInputDataSet
+                            .builder()
+                            .parameters(Map.of("prompt", prompt, "datasourceType", parameters.getOrDefault("type", "Opensearch")))
+                            .build();
+                    ActionRequest request = new MLPredictionTaskRequest(
+                            modelId,
+                            MLInput.builder().algorithm(FunctionName.REMOTE).inputDataset(inputDataSet).build(),
+                            null,
+                            tenantId
                     );
-                // Execute output here
-            }, e -> {
-                log.error(String.format(Locale.ROOT, "fail to predict model: %s with error: %s", modelId, e.getMessage()), e);
-                listener.onFailure(e);
-            }));
-        }, e -> {
-            log.info("fail to get index schema");
-            listener.onFailure(e);
-        }
+                    client.execute(MLPredictionTaskAction.INSTANCE, request, ActionListener.wrap(mlTaskResponse -> {
+                        ModelTensorOutput modelTensorOutput = (ModelTensorOutput) mlTaskResponse.getOutput();
+                        ModelTensors modelTensors = modelTensorOutput.getMlModelOutputs().get(0);
+                        ModelTensor modelTensor = modelTensors.getMlModelTensors().get(0);
+                        Map<String, String> dataAsMap = (Map<String, String>) modelTensor.getDataAsMap();
+                        if (dataAsMap.get("response") == null) {
+                            listener.onFailure(new IllegalStateException("Remote endpoint fails to inference."));
+                            return;
+                        }
+                        String ppl = parseOutput(dataAsMap.get("response"), indexName);
+                        if (!this.execute) {
+                            Map<String, String> ret = ImmutableMap.of("ppl", ppl);
+                            listener.onResponse((T) AccessController.doPrivileged((PrivilegedExceptionAction<String>) () -> gson.toJson(ret)));
+                            return;
+                        }
+                        JSONObject jsonContent = new JSONObject(ImmutableMap.of("query", ppl));
+                        PPLQueryRequest pplQueryRequest = new PPLQueryRequest(ppl, jsonContent, null, "jdbc");
+                        TransportPPLQueryRequest transportPPLQueryRequest = new TransportPPLQueryRequest(pplQueryRequest);
+                        client
+                                .execute(
+                                        PPLQueryAction.INSTANCE,
+                                        transportPPLQueryRequest,
+                                        getPPLTransportActionListener(ActionListener.wrap(transportPPLQueryResponse -> {
+                                            String results = transportPPLQueryResponse.getResult();
+                                            Map<String, String> returnResults = ImmutableMap.of("ppl", ppl, "executionResult", results);
+                                            listener
+                                                    .onResponse(
+                                                            (T) AccessController.doPrivileged((PrivilegedExceptionAction<String>) () -> gson.toJson(returnResults))
+                                                    );
+                                        }, e -> {
+                                            String pplError = "execute ppl:" + ppl + ", get error: " + e.getMessage();
+                                            Exception exception = new Exception(pplError, e);
+                                            listener.onFailure(exception);
+                                        }))
+                                );
+                        // Execute output here
+                    }, e -> {
+                        log.error(String.format(Locale.ROOT, "fail to predict model: %s with error: %s", modelId, e.getMessage()), e);
+                        listener.onFailure(e);
+                    }));
+                }, e -> {
+                    log.info("fail to get index schema");
+                    listener.onFailure(e);
+                }
 
         );
         if (parameters.containsKey("schema")
@@ -278,8 +285,8 @@ public class PPLTool implements WithModelTool {
             List<Object> samples = gson.fromJson(parameters.get("samples"), List.class);
             try {
                 String tableInfo = constructTableInfoByPPLResultForSpark(
-                    transferS3SchemaFormat(schema),
-                    (Map<String, Object>) samples.get(0)
+                        transferS3SchemaFormat(schema),
+                        (Map<String, Object>) samples.get(0)
                 );
                 actionsAfterTableinfo.onResponse(tableInfo);
             } catch (Exception e) {
@@ -299,8 +306,21 @@ public class PPLTool implements WithModelTool {
             SearchRequest searchRequest = buildSearchRequest(firstIndexName);
             client.search(searchRequest, ActionListener.wrap(searchResponse -> {
                 SearchHit[] searchHits = searchResponse.getHits().getHits();
-                String tableInfo = constructTableInfo(searchHits, mappings);
-                actionsAfterTableinfo.onResponse(tableInfo);
+                client.search(buildDescriptionSearchRequest(indexName), ActionListener.wrap(
+                        descriptionResponse -> {
+                            String tableInfo = constructTableInfo(searchHits, mappings, parseMap(descriptionResponse));
+                            actionsAfterTableinfo.onResponse(tableInfo);
+                        }, e -> {
+                            log.error("fail to get description");
+                            String tableInfo = null;
+                            try {
+                                tableInfo = constructTableInfo(searchHits, mappings, Map.of());
+                            } catch (PrivilegedActionException ex) {
+                                listener.onFailure(ex);
+                            }
+                            actionsAfterTableinfo.onResponse(tableInfo);
+                        }
+                ));
             }, e -> {
                 log.error(String.format(Locale.ROOT, "fail to search model: %s with error: %s", modelId, e.getMessage()), e);
                 listener.onFailure(e);
@@ -310,11 +330,11 @@ public class PPLTool implements WithModelTool {
             String errorMessage = e.getMessage();
             if (errorMessage.contains("no such index")) {
                 listener
-                    .onFailure(
-                        new IllegalArgumentException(
-                            "Return this final answer to human directly and do not use other tools: 'Please provide index name'. Please try to directly send this message to human to ask for index name"
-                        )
-                    );
+                        .onFailure(
+                                new IllegalArgumentException(
+                                        "Return this final answer to human directly and do not use other tools: 'Please provide index name'. Please try to directly send this message to human to ask for index name"
+                                )
+                        );
             } else {
                 listener.onFailure(e);
             }
@@ -338,6 +358,7 @@ public class PPLTool implements WithModelTool {
 
     public static class Factory implements WithModelTool.Factory<PPLTool> {
         private Client client;
+        private IndicesHelper indicesHelper;
 
         private static Factory INSTANCE;
 
@@ -354,21 +375,31 @@ public class PPLTool implements WithModelTool {
             }
         }
 
-        public void init(Client client) {
+        public void init(Client client, IndicesHelper indicesHelper) {
             this.client = client;
+            this.indicesHelper = indicesHelper;
         }
 
         @Override
         public PPLTool create(Map<String, Object> map) {
             validatePPLToolParameters(map);
+
+            this.indicesHelper.initIndexIfAbsent(SkillsIndexEnum.SKILLS_INDEX_SUMMARY, ActionListener.wrap(
+                    created -> {
+                        log.info("create system successfully");
+                    }, e -> {
+                        log.error("fail to create skills indices due to:" + e.getMessage());
+                    }
+            ));
+
             return new PPLTool(
-                client,
-                (String) map.get(COMMON_MODEL_ID_FIELD),
-                (String) map.getOrDefault("prompt", ""),
-                (String) map.getOrDefault("model_type", ""),
-                (String) map.getOrDefault("previous_tool_name", ""),
-                NumberUtils.toInt((String) map.get("head"), -1),
-                Boolean.parseBoolean((String) map.getOrDefault("execute", "true"))
+                    client,
+                    (String) map.get(COMMON_MODEL_ID_FIELD),
+                    (String) map.getOrDefault("prompt", ""),
+                    (String) map.getOrDefault("model_type", ""),
+                    (String) map.getOrDefault("previous_tool_name", ""),
+                    NumberUtils.toInt((String) map.get("head"), -1),
+                    Boolean.parseBoolean((String) map.getOrDefault("execute", "true"))
             );
         }
 
@@ -398,6 +429,13 @@ public class PPLTool implements WithModelTool {
         searchSourceBuilder.size(1).query(new MatchAllQueryBuilder());
         // client;
         return new SearchRequest(new String[] { indexName }, searchSourceBuilder);
+    }
+
+    private SearchRequest buildDescriptionSearchRequest(String indexName) {
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchSourceBuilder.size(1).query(new TermQueryBuilder("index_name", indexName));
+        // client;
+        return new SearchRequest(new String[] { SkillsIndexEnum.SKILLS_INDEX_SUMMARY.getIndexName() }, searchSourceBuilder);
     }
 
     private GetMappingsRequest buildGetMappingRequest(String indexName) {
@@ -470,7 +508,7 @@ public class PPLTool implements WithModelTool {
     }
 
     private String constructTableInfoByPPLResultForSpark(Map<String, Object> schema, Map<String, Object> samples)
-        throws PrivilegedActionException {
+            throws PrivilegedActionException {
         Map<String, String> fieldsToType = new HashMap<>();
         for (Map.Entry<String, Object> entry : schema.entrySet()) {
             String key = entry.getKey();
@@ -504,13 +542,13 @@ public class PPLTool implements WithModelTool {
 
     }
 
-    private String constructTableInfo(SearchHit[] searchHits, Map<String, MappingMetadata> mappings) throws PrivilegedActionException {
+    private String constructTableInfo(SearchHit[] searchHits, Map<String, MappingMetadata> mappings, Map<String, Object> description) throws PrivilegedActionException {
         String firstIndexName = (String) mappings.keySet().toArray()[0];
         MappingMetadata mappingMetadata = mappings.get(firstIndexName);
         Map<String, Object> mappingSource = (Map<String, Object>) mappingMetadata.getSourceAsMap().get("properties");
         if (Objects.isNull(mappingSource)) {
             throw new IllegalArgumentException(
-                "The querying index doesn't have mapping metadata, please add data to it or using another index."
+                    "The querying index doesn't have mapping metadata, please add data to it or using another index."
             );
         }
         Map<String, String> fieldsToType = new HashMap<>();
@@ -531,6 +569,9 @@ public class PPLTool implements WithModelTool {
             for (String key : sortedKeys) {
                 if (ALLOWED_FIELDS_TYPE.contains(fieldsToType.get(key))) {
                     String line = "- " + key + ": " + fieldsToType.get(key) + " (" + fieldsToSample.get(key) + ")";
+                    if (description.containsKey(key)) {
+                        line += " [" + description.get(key).toString() + "]";
+                    }
                     tableInfoJoiner.add(line);
                 }
             }
@@ -538,12 +579,22 @@ public class PPLTool implements WithModelTool {
             for (String key : sortedKeys) {
                 if (ALLOWED_FIELDS_TYPE.contains(fieldsToType.get(key))) {
                     String line = "- " + key + ": " + fieldsToType.get(key);
+                    if (description.containsKey(key)) {
+                        line += " [" + description.get(key).toString() + "]";
+                    }
                     tableInfoJoiner.add(line);
                 }
             }
         }
 
         return tableInfoJoiner.toString();
+    }
+
+    private Map<String, Object> parseMap(SearchResponse descriptionResponse) {
+        SearchHit[] hits = descriptionResponse.getHits().getHits();
+        SearchHit hit = hits[0];
+        Map<String, Object> map = gson.fromJson((String) hit.getSourceAsMap().get("field_description"), Map.class);
+        return map;
     }
 
     private String constructPrompt(String tableInfo, String question, String indexName) {
@@ -553,7 +604,7 @@ public class PPLTool implements WithModelTool {
     }
 
     private static void extractSamples(Map<String, Object> sampleSource, Map<String, String> fieldsToSample, String prefix)
-        throws PrivilegedActionException {
+            throws PrivilegedActionException {
         if (!prefix.isEmpty()) {
             prefix += ".";
         }

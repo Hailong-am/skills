@@ -11,8 +11,11 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
+import lombok.extern.log4j.Log4j2;
+import org.opensearch.agent.indices.IndicesHelper;
 import org.opensearch.agent.tools.CreateAlertTool;
 import org.opensearch.agent.tools.CreateAnomalyDetectorTool;
+import org.opensearch.agent.tools.IndexSummarizeTool;
 import org.opensearch.agent.tools.DynamicTool;
 import org.opensearch.agent.tools.LogPatternAnalysisTool;
 import org.opensearch.agent.tools.LogPatternTool;
@@ -54,8 +57,13 @@ import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
 import lombok.SneakyThrows;
-
+@Log4j2
 public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlugin {
+
+    private Client client;
+    private ClusterService clusterService;
+    private NamedXContentRegistry xContentRegistry;
+    private IndicesHelper indicesHelper;
 
     private final AtomicReference<RestController> restControllerRef = new AtomicReference<>();
     public static final String SKILLS_THREAD_POOL_PREFIX = "thread_pool.skills";
@@ -90,7 +98,12 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlug
         IndexNameExpressionResolver indexNameExpressionResolver,
         Supplier<RepositoriesService> repositoriesServiceSupplier
     ) {
-        PPLTool.Factory.getInstance().init(client);
+        this.client = client;
+        this.clusterService = clusterService;
+        this.xContentRegistry = xContentRegistry;
+        this.indicesHelper = new IndicesHelper(clusterService, client);
+        PPLTool.Factory.getInstance().init(client, indicesHelper);
+        IndexSummarizeTool.Factory.getInstance().init(client, indicesHelper);
         NeuralSparseSearchTool.Factory.getInstance().init(client, xContentRegistry);
         VectorDBTool.Factory.getInstance().init(client, xContentRegistry);
         RAGTool.Factory.getInstance().init(client, xContentRegistry);
@@ -113,6 +126,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlug
         return List
             .of(
                 PPLTool.Factory.getInstance(),
+                IndexSummarizeTool.Factory.getInstance(),
                 NeuralSparseSearchTool.Factory.getInstance(),
                 VectorDBTool.Factory.getInstance(),
                 RAGTool.Factory.getInstance(),

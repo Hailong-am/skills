@@ -122,7 +122,7 @@ public class PPLToolTests {
             listener.onResponse(transportPPLQueryResponse);
             return null;
         }).when(client).execute(eq(PPLQueryAction.INSTANCE), any(), any());
-        PPLTool.Factory.getInstance().init(client);
+        PPLTool.Factory.getInstance().init(client, null);
     }
 
     @Test
