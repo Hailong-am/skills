@@ -99,7 +99,8 @@ public class Drain3 {
             if (addToCluster) {
                 // Add to existing cluster
                 cluster.addLogMessage(logMessage);
-                extractParameters(cluster, tokens);
+                // Make sure the cluster cache is updated
+                clusterCache.put(cluster.getClusterId(), cluster);
                 log.debug("Added to existing cluster: {}", cluster.getClusterId());
             }
         } else if (addToCluster) {
@@ -120,23 +121,14 @@ public class Drain3 {
     private List<String> tokenize(String logMessage) {
         String cleanedMessage = logMessage.trim();
 
-        if (config.isPreFilterTokens()) {
-            cleanedMessage = preFilter(cleanedMessage);
-        }
+        // Apply masker if configured
+        if (config.getMasker() != null) {
+            cleanedMessage = config.getMasker().mask(cleanedMessage);
+            log.debug("Masked log message: {}", cleanedMessage);
+        } 
 
         String[] rawTokens = delimiterPattern.split(cleanedMessage);
-        List<String> tokens = new ArrayList<>();
-
-        for (String token : rawTokens) {
-            if (token != null && !token.trim().isEmpty()) {
-                String processedToken = processToken(token.trim());
-                if (!processedToken.isEmpty()) {
-                    tokens.add(processedToken);
-                }
-            }
-        }
-
-        return tokens;
+        return List.of(rawTokens);
     }
 
     /**
@@ -144,36 +136,10 @@ public class Drain3 {
      */
     private String preFilter(String message) {
         // Remove common prefixes like timestamps
-        String filtered = message.replaceAll("^\\d{4}-\\d{2}-\\d{2}[\\sT]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?", "");
-        filtered = filtered.replaceAll("^\\[?\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?\\]?", "");
-        filtered = filtered.replaceAll("^\\d+", "");
+        String filtered = message.replaceAll("^\\d{4}-\\d{2}-\\d{2}[\\sT]\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?",
+                "<DATETIME>");
+        filtered = filtered.replaceAll("^\\[?\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{3})?]?", "<TIME>");
         return filtered.trim();
-    }
-
-    /**
-     * Process individual token
-     */
-    private String processToken(String token) {
-        if (config.isRemoveDelimiters()) {
-            token = token.replaceAll("[^\\w\\s]", "");
-        }
-
-        // Check if token is a number
-        if (token.matches("^-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?$")) {
-            return token; // Keep numbers as-is
-        }
-
-        // Check if token is a URL
-        if (token.matches("https?://.*|ftp://.*|www\\..*")) {
-            return "<URL>";
-        }
-
-        // Check if token is an IP address
-        if (token.matches("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")) {
-            return "<IP>";
-        }
-
-        return token.toLowerCase();
     }
 
     /**
@@ -298,10 +264,12 @@ public class Drain3 {
 
         LogCluster cluster = new LogCluster(template);
         cluster.addLogMessage(logMessage);
-        extractParameters(cluster, tokens);
 
         // Add to tree
         addClusterToTree(cluster, tokens);
+        
+        // Add to cluster cache for future lookups by ID
+        clusterCache.put(cluster.getClusterId(), cluster);
 
         totalClusters.incrementAndGet();
         return cluster;
@@ -440,18 +408,6 @@ public class Drain3 {
         
         // Add cluster to the final node
         currentNode.addCluster(cluster);
-    }
-
-    /**
-     * Extract parameters from log message
-     */
-    private void extractParameters(LogCluster cluster, List<String> tokens) {
-        if (cluster.getLogTemplate() == null) {
-            return;
-        }
-
-        Map<String, String> parameters = cluster.extractParameters(tokens);
-        log.debug("Extracted parameters: {}", parameters);
     }
 
     /**

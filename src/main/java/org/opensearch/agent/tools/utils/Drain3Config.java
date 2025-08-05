@@ -103,4 +103,11 @@ public class Drain3Config {
      */
     @Builder.Default
     private boolean postProcessTemplates = true;
+    
+    /**
+     * Masker to use for preprocessing log messages
+     * If null, no masking will be performed
+     */
+    @Builder.Default
+    private Masker masker = null;
 }

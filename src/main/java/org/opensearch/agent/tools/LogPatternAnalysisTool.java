@@ -9,6 +9,12 @@ import static org.opensearch.agent.tools.utils.HierarchicalAgglomerativeClusteri
 import static org.opensearch.agent.tools.utils.ToolHelper.getPPLTransportActionListener;
 import static org.opensearch.ml.common.utils.StringUtils.gson;
 
+import org.opensearch.agent.tools.utils.DefaultMasker;
+import org.opensearch.agent.tools.utils.Drain3;
+import org.opensearch.agent.tools.utils.Drain3Config;
+import org.opensearch.agent.tools.utils.LogCluster;
+import org.opensearch.search.SearchHit;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -17,18 +23,27 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import org.apache.commons.math3.ml.clustering.CentroidCluster;
 import org.apache.commons.math3.ml.clustering.DoublePoint;
 import org.apache.commons.math3.ml.clustering.KMeansPlusPlusClusterer;
 import org.apache.commons.math3.ml.distance.DistanceMeasure;
 import org.json.JSONObject;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.agent.tools.utils.HierarchicalAgglomerativeClustering;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.index.query.RangeQueryBuilder;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.search.sort.SortOrder;
 import org.opensearch.core.common.Strings;
 import org.opensearch.ml.common.spi.tools.Tool;
 import org.opensearch.ml.common.spi.tools.ToolAnnotation;
@@ -96,14 +111,22 @@ public class LogPatternAnalysisTool implements Tool {
 
     // Constants
     private static final String DEFAULT_DESCRIPTION =
-        "This is a tool used to detect selection log patterns by the patterns command in PPL or to detect selection log sequences by the log clustering algorithm.";
+        "This is a tool used to detect selection log patterns by the Drain3 log clustering algorithm or to detect selection log sequences by the log clustering algorithm.";
     private static final double LOG_VECTORS_CLUSTERING_THRESHOLD = 0.5;
     private static final double LOG_PATTERN_THRESHOLD = 0.75;
     private static final double LOG_PATTERN_LIFT = 3;
     private static final String DEFAULT_TIME_FIELD = "@timestamp";
-
-    // Compiled regex patterns for better performance
-    private static final Pattern REPEATED_WILDCARDS_PATTERN = Pattern.compile("(<\\*>)(\\s+<\\*>)+");
+    
+    // Drain3 configuration
+    private static final double DRAIN3_SIMILARITY_THRESHOLD = 0.5;
+    private static final int DRAIN3_MAX_DEPTH = 5;
+    private static final int DRAIN3_MAX_CHILDREN = 100;
+    private static final int MAX_LOG_FETCH_SIZE = 10000;
+    
+    // Drain3 instance for log pattern analysis
+    private final Drain3 drain3;
+    
+    // Removed regex pattern since we're using cluster IDs
 
     /**
      * Parameter class to hold analysis parameters with validation
@@ -176,6 +199,23 @@ public class LogPatternAnalysisTool implements Tool {
 
     public LogPatternAnalysisTool(Client client) {
         this.client = client;
+        
+        // Create a DefaultMasker for log preprocessing
+        DefaultMasker defaultMasker = new DefaultMasker();
+        
+        // Add any custom patterns if needed
+        // For example, masking timestamps, IPs, etc. is already handled by DefaultMasker
+        
+        // Initialize Drain3 with custom configuration including the masker
+        Drain3Config drain3Config = Drain3Config.builder()
+            .delimiters("[\\s+]")
+            .similarityThreshold(DRAIN3_SIMILARITY_THRESHOLD)
+            .maxDepth(DRAIN3_MAX_DEPTH)
+            .maxChildren(DRAIN3_MAX_CHILDREN)
+            .masker(defaultMasker)
+            .build();
+            
+        this.drain3 = new Drain3(drain3Config);
     }
 
     @Override
@@ -248,114 +288,145 @@ public class LogPatternAnalysisTool implements Tool {
                 // Step 3: Generate comparison result
                 generateSequenceComparisonResult(baseResult, selectionResult, listener);
             }, listener::onFailure));
-        }, this::handlePPLError));
+        }, this::handleSearchError));
     }
 
+    /**
+     * Analyze logs in the base time range using Drain3
+     */
     private <T> void analyzeBaseTimeRange(AnalysisParameters params, ActionListener<PatternAnalysisResult> listener) {
-        String baseTimeRangeLogPatternPPL = buildLogPatternPPL(
-            params.index,
-            params.timeField,
-            params.logFieldName,
-            params.traceFieldName,
-            params.baseTimeRangeStart,
-            params.baseTimeRangeEnd
+        log.debug("Analyzing base time range logs from index {}", params.index);
+        
+        // Create search request for logs with trace field
+        SearchRequest searchRequest = new SearchRequest(params.index);
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        
+        // Build time range query
+        searchSourceBuilder.query(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.rangeQuery(params.timeField)
+                    .from(params.baseTimeRangeStart, true)
+                    .to(params.baseTimeRangeEnd, true))
+                .must(QueryBuilders.existsQuery(params.traceFieldName))
         );
-
-        log.debug("Executing base time range PPL: {}", baseTimeRangeLogPatternPPL);
-        executePPL(baseTimeRangeLogPatternPPL, ActionListener.wrap(response -> {
+        
+        searchSourceBuilder.size(MAX_LOG_FETCH_SIZE);
+        searchSourceBuilder.sort(params.timeField, SortOrder.ASC);
+        searchSourceBuilder.fetchSource(new String[]{params.logFieldName, params.traceFieldName, params.timeField}, null);
+        
+        searchRequest.source(searchSourceBuilder);
+        
+        // Execute search
+        client.search(searchRequest, ActionListener.wrap(searchResponse -> {
             try {
-                PatternAnalysisResult result = processPatternAnalysisResponse(response);
+                // Process search results into trace pattern map
+                Map<String, Set<String>> tracePatternMap = new HashMap<>();
+                Map<String, Set<String>> patternCountMap = new HashMap<>();
+                Map<String, String> rawPatternCache = new HashMap<>();
+
+                for (SearchHit hit : searchResponse.getHits()) {
+                    Map<String, Object> source = hit.getSourceAsMap();
+                    if (source.containsKey(params.logFieldName) && source.containsKey(params.traceFieldName)) {
+                        String traceId = source.get(params.traceFieldName).toString();
+                        String logMessage = source.get(params.logFieldName).toString();
+                        
+                        // Process with Drain3
+                        LogCluster cluster = drain3.parseLog(logMessage);
+                        String clusterId = cluster.getClusterId();
+                        
+                        // Using clusterId directly - no need for post-processing
+                        String simplifiedPattern = clusterId;
+                        
+                        // Store in trace pattern map
+                        tracePatternMap.computeIfAbsent(traceId, k -> new LinkedHashSet<>()).add(simplifiedPattern);
+                        patternCountMap.computeIfAbsent(simplifiedPattern, k -> new HashSet<>()).add(traceId);
+                    }
+                }
+                
+                // Calculate pattern vectors
+                Map<String, Double> patternValues = vectorizePattern(patternCountMap, tracePatternMap.size());
+                
+                PatternAnalysisResult result = new PatternAnalysisResult(
+                    tracePatternMap, patternCountMap, patternValues, tracePatternMap.size());
+                    
                 listener.onResponse(result);
+                
             } catch (Exception e) {
-                log.error("Failed to process base time range response", e);
+                log.error("Failed to process base time range logs", e);
                 listener.onFailure(new RuntimeException("Failed to process base time range analysis", e));
             }
         }, listener::onFailure));
     }
 
+    /**
+     * Analyze logs in the selection time range using Drain3
+     * Uses the same Drain3 instance as the base time range for consistent patterns
+     */
     private <T> void analyzeSelectionTimeRange(AnalysisParameters params, ActionListener<PatternAnalysisResult> listener) {
-        String selectionTimeRangeLogPatternPPL = buildLogPatternPPL(
-            params.index,
-            params.timeField,
-            params.logFieldName,
-            params.traceFieldName,
-            params.selectionTimeRangeStart,
-            params.selectionTimeRangeEnd
+        log.debug("Analyzing selection time range logs from index {}", params.index);
+        
+        // Create search request for logs with trace field
+        SearchRequest searchRequest = new SearchRequest(params.index);
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        
+        // Build time range query
+        searchSourceBuilder.query(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.rangeQuery(params.timeField)
+                    .from(params.selectionTimeRangeStart, true)
+                    .to(params.selectionTimeRangeEnd, true))
+                .must(QueryBuilders.existsQuery(params.traceFieldName))
         );
-
-        log.debug("Executing selection time range PPL: {}", selectionTimeRangeLogPatternPPL);
-        executePPL(selectionTimeRangeLogPatternPPL, ActionListener.wrap(response -> {
+        
+        searchSourceBuilder.size(MAX_LOG_FETCH_SIZE);
+        searchSourceBuilder.sort(params.timeField, SortOrder.ASC);
+        searchSourceBuilder.fetchSource(new String[]{params.logFieldName, params.traceFieldName, params.timeField}, null);
+        
+        searchRequest.source(searchSourceBuilder);
+        
+        // Execute search
+        client.search(searchRequest, ActionListener.wrap(searchResponse -> {
             try {
-                PatternAnalysisResult result = processPatternAnalysisResponse(response);
+                // Process search results into trace pattern map
+                Map<String, Set<String>> tracePatternMap = new HashMap<>();
+                Map<String, Set<String>> patternCountMap = new HashMap<>();
+                Map<String, String> rawPatternCache = new HashMap<>();
+                
+                for (SearchHit hit : searchResponse.getHits()) {
+                    Map<String, Object> source = hit.getSourceAsMap();
+                    if (source.containsKey(params.logFieldName) && source.containsKey(params.traceFieldName)) {
+                        String traceId = source.get(params.traceFieldName).toString();
+                        String logMessage = source.get(params.logFieldName).toString();
+                        
+                        // Process with Drain3 - using same instance as base time range
+                        LogCluster cluster = drain3.parseLog(logMessage);
+                        String clusterId = cluster.getClusterId();
+                        
+                        // Using clusterId directly - no need for post-processing
+                        String simplifiedPattern = clusterId;
+                        
+                        // Store in trace pattern map
+                        tracePatternMap.computeIfAbsent(traceId, k -> new LinkedHashSet<>()).add(simplifiedPattern);
+                        patternCountMap.computeIfAbsent(simplifiedPattern, k -> new HashSet<>()).add(traceId);
+                    }
+                }
+                
+                // Calculate pattern vectors
+                Map<String, Double> patternValues = vectorizePattern(patternCountMap, tracePatternMap.size());
+                
+                PatternAnalysisResult result = new PatternAnalysisResult(
+                    tracePatternMap, patternCountMap, patternValues, tracePatternMap.size());
+                    
                 listener.onResponse(result);
+                
             } catch (Exception e) {
-                log.error("Failed to process selection time range response", e);
+                log.error("Failed to process selection time range logs", e);
                 listener.onFailure(new RuntimeException("Failed to process selection time range analysis", e));
             }
         }, listener::onFailure));
     }
 
-    private String buildLogPatternPPL(
-        String index,
-        String timeField,
-        String logFieldName,
-        String traceFieldName,
-        String startTime,
-        String endTime
-    ) {
-        return String
-            .format(
-                "source=%s | where %s!='' | where %s>'%s' and %s<'%s' | patterns %s method=brain "
-                    + "variable_count_threshold=3 | fields %s, patterns_field, %s | sort %s",
-                index,
-                traceFieldName,
-                timeField,
-                startTime,
-                timeField,
-                endTime,
-                logFieldName,
-                traceFieldName,
-                timeField,
-                timeField
-            );
-    }
 
-    private PatternAnalysisResult processPatternAnalysisResponse(String response) {
-        Map<String, Object> pplResult = gson.fromJson(response, new TypeToken<Map<String, Object>>() {
-        }.getType());
-
-        Object datarowsObj = pplResult.get("datarows");
-        if (!(datarowsObj instanceof List)) {
-            throw new IllegalStateException("Invalid PPL response format: missing or invalid datarows");
-        }
-
-        @SuppressWarnings("unchecked")
-        List<List<Object>> dataRows = (List<List<Object>>) datarowsObj;
-
-        Map<String, Set<String>> tracePatternMap = new HashMap<>();
-        Map<String, Set<String>> patternCountMap = new HashMap<>();
-        Map<String, String> rawPatternCache = new HashMap<>();
-
-        for (List<Object> row : dataRows) {
-            if (row.size() < 2) {
-                log.warn("Skipping invalid row with insufficient columns: {}", row);
-                continue;
-            }
-
-            String traceId = (String) row.get(0);
-            String rawPattern = (String) row.get(1);
-
-            String simplifiedPattern = rawPatternCache.computeIfAbsent(rawPattern, this::postProcessPattern);
-
-            tracePatternMap.computeIfAbsent(traceId, k -> new LinkedHashSet<>()).add(simplifiedPattern);
-            patternCountMap.computeIfAbsent(simplifiedPattern, k -> new HashSet<>()).add(traceId);
-        }
-
-        // Calculate pattern values using IDF and sigmoid
-        Map<String, Double> patternVectors = vectorizePattern(patternCountMap, tracePatternMap.size());
-
-        return new PatternAnalysisResult(tracePatternMap, patternCountMap, patternVectors, tracePatternMap.size());
-    }
 
     private Map<String, Double> vectorizePattern(Map<String, Set<String>> patternCountMap, int totalTraceCount) {
         Map<String, Double> patternValues = new HashMap<>();
@@ -429,7 +500,6 @@ public class LogPatternAnalysisTool implements Tool {
                 selectionResult.tracePatternMap
             );
 
-            System.out.println("==::::" + gson.toJson(result));
 
             listener.onResponse((T) gson.toJson(result));
 
@@ -468,6 +538,8 @@ public class LogPatternAnalysisTool implements Tool {
         for (Map.Entry<String, Set<String>> entry : tracePatternMap.entrySet()) {
             String traceId = entry.getKey();
             Set<String> patterns = entry.getValue();
+            // for trace with single pattern, we have already done the analysis in pattern difference
+            if (patterns.size() ==1) continue;
             double[] vector = new double[vectorSize];
 
             for (String pattern : patterns) {
@@ -535,18 +607,20 @@ public class LogPatternAnalysisTool implements Tool {
     ) {
         Map<String, String> baseSequences = new HashMap<>();
         for (String centroid : baseCentroids) {
-            Set<String> patterns = baseTracePatternMap.get(centroid);
-            if (patterns != null) {
-                baseSequences.put(centroid, String.join(" -> ", patterns));
-            }
+            String patterns =
+                    baseTracePatternMap.get(centroid).stream().sequential()
+                            .filter((id) -> !Objects.isNull(id) && this.drain3.getCluster(id) != null)
+                            .map((id) -> this.drain3.getCluster(id).getTemplateString())
+                            .collect(Collectors.joining(", ", "[", "]"));
+            baseSequences.put(centroid, patterns);
         }
 
         Map<String, String> selectionSequences = new HashMap<>();
         for (String centroid : selectionCentroids) {
-            Set<String> patterns = selectionTracePatternMap.get(centroid);
-            if (patterns != null) {
-                selectionSequences.put(centroid, String.join(" -> ", patterns));
-            }
+            String patterns = selectionTracePatternMap.get(centroid)
+                    .stream().map((id) -> this.drain3.getCluster(id).getTemplateString())
+                    .collect(Collectors.joining(", ", "[", "]"));
+            selectionSequences.put(centroid, patterns);
         }
 
         Map<String, Map<String, String>> result = new HashMap<>();
@@ -556,6 +630,84 @@ public class LogPatternAnalysisTool implements Tool {
         return result;
     }
 
+    /**
+     * Fetch logs from an index based on time range and process them with Drain3
+     * 
+     * @param index Index name to fetch logs from
+     * @param timeField Field name for timestamp
+     * @param logFieldName Field name containing log messages
+     * @param startTime Start time for logs (ISO format)
+     * @param endTime End time for logs (ISO format)
+     * @param listener Listener to call when complete with Map of patterns to counts
+     */
+    private void fetchLogsAndProcess(
+        String index,
+        String timeField,
+        String logFieldName,
+        String startTime,
+        String endTime,
+        ActionListener<Map<String, Double>> listener
+    ) {
+        log.info("Fetching logs from index {} in time range {} to {}", index, startTime, endTime);
+        
+        // Create search request
+        SearchRequest searchRequest = new SearchRequest(index);
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        
+        // Build time range query
+        RangeQueryBuilder rangeQuery = QueryBuilders.rangeQuery(timeField)
+            .from(startTime, true)
+            .to(endTime, true);
+            
+        searchSourceBuilder.query(rangeQuery);
+        searchSourceBuilder.size(MAX_LOG_FETCH_SIZE);  // Fetch a large batch
+        searchSourceBuilder.sort(timeField, SortOrder.ASC);
+        searchSourceBuilder.fetchSource(new String[]{logFieldName}, null);
+        
+        searchRequest.source(searchSourceBuilder);
+        
+        // Execute search
+        client.search(searchRequest, ActionListener.wrap(searchResponse -> {
+            try {
+                Map<String, Double> patternMap = new HashMap<>();
+                Map<LogCluster, Integer> clusterCountMap = new HashMap<>();
+                
+                // Process logs with Drain3
+                for (SearchHit hit : searchResponse.getHits().getHits()) {
+                    Map<String, Object> source = hit.getSourceAsMap();
+                    if (source.containsKey(logFieldName)) {
+                        String logMessage = source.get(logFieldName).toString();
+                        
+                        // Process with Drain3
+                        LogCluster cluster = drain3.parseLog(logMessage);
+                        
+                        // Count occurrences
+                        clusterCountMap.put(cluster, clusterCountMap.getOrDefault(cluster, 0) + 1);
+                    }
+                }
+                
+                // Convert clusters to pattern map
+                for (Map.Entry<LogCluster, Integer> entry : clusterCountMap.entrySet()) {
+                    LogCluster cluster = entry.getKey();
+                    int count = entry.getValue();
+                    
+                    patternMap.put(cluster.getTemplateString(), (double) count);
+                }
+                
+                log.info("Processed {} logs, found {} patterns", searchResponse.getHits().getTotalHits().toString(), patternMap.size());
+                
+                listener.onResponse(patternMap);
+                
+            } catch (Exception e) {
+                log.error("Error processing logs with Drain3", e);
+                listener.onFailure(e);
+            }
+        }, e -> {
+            log.error("Failed to fetch logs from index {}", index, e);
+            listener.onFailure(e);
+        }));
+    }
+    
     private <T> void logPatternDiffAnalysis(AnalysisParameters params, ActionListener<T> listener) {
         log
             .debug(
@@ -566,49 +718,31 @@ public class LogPatternAnalysisTool implements Tool {
                 params.selectionTimeRangeEnd
             );
 
-        // Step 1: Generate log patterns for baseline time range
-        String baseTimeRangeLogPatternPPL = buildLogPatternPPL(
+        // Step 1: Generate log patterns for baseline time range using Drain3
+        log.debug("Fetching and processing base time range logs");
+        fetchLogsAndProcess(
             params.index,
             params.timeField,
             params.logFieldName,
             params.baseTimeRangeStart,
-            params.baseTimeRangeEnd
-        );
-        Function<List<List<Object>>, Map<String, Double>> dataRowsParser = dataRows -> {
-            Map<String, Double> patternMap = new HashMap<>();
-            for (List<Object> row : dataRows) {
-                if (row.size() == 2) {
-                    String pattern = (String) row.get(1);
-                    double count = ((Number) row.get(0)).doubleValue();
-                    patternMap.put(pattern, count);
-                }
-            }
-            return patternMap;
-        };
-
-        log.debug("Executing base time range pattern PPL: {}", baseTimeRangeLogPatternPPL);
-        executePPL(baseTimeRangeLogPatternPPL, ActionListener.wrap(baseResponse -> {
+            params.baseTimeRangeEnd,
+            ActionListener.wrap(basePatterns -> {
             try {
-                Map<String, Double> basePatterns = parseLogPatterns(baseResponse, dataRowsParser).orElse(new HashMap<>());
                 mergeSimilarPatterns(basePatterns);
-
                 log.debug("Base patterns processed: {} patterns", basePatterns.size());
 
-                // Step 2: Generate log patterns for selection time range
-                String selectionTimeRangeLogPatternPPL = buildLogPatternPPL(
+                // Step 2: Generate log patterns for selection time range using Drain3
+                // Note: We're using the same Drain3 instance to maintain consistent patterns
+                log.debug("Fetching and processing selection time range logs");
+                fetchLogsAndProcess(
                     params.index,
                     params.timeField,
                     params.logFieldName,
                     params.selectionTimeRangeStart,
-                    params.selectionTimeRangeEnd
-                );
-
-                log.debug("Executing selection time range pattern PPL: {}", selectionTimeRangeLogPatternPPL);
-                executePPL(selectionTimeRangeLogPatternPPL, ActionListener.wrap(selectionResponse -> {
+                    params.selectionTimeRangeEnd,
+                    ActionListener.wrap(selectionPatterns -> {
                     try {
-                        Map<String, Double> selectionPatterns = parseLogPatterns(selectionResponse, dataRowsParser).orElse(new HashMap<>());
                         mergeSimilarPatterns(selectionPatterns);
-
                         log.debug("Selection patterns processed: {} patterns", selectionPatterns.size());
 
                         // Step 3: Calculate pattern differences
@@ -631,9 +765,120 @@ public class LogPatternAnalysisTool implements Tool {
                 log.error("Failed to process base pattern response", e);
                 listener.onFailure(new RuntimeException("Failed to process base patterns", e));
             }
-        }, this::handlePPLError));
+        }, this::handleSearchError));
     }
 
+    /**
+     * Fetch logs with error keywords and process them with Drain3
+     * 
+     * @param index Index name to fetch logs from
+     * @param timeField Field name for timestamp
+     * @param logFieldName Field name containing log messages
+     * @param startTime Start time for logs (ISO format)
+     * @param endTime End time for logs (ISO format) 
+     * @param errorKeywords List of error keywords to match
+     * @param listener Listener to call when complete with Map of patterns to sample logs
+     */
+    private void fetchErrorLogsAndProcess(
+        String index,
+        String timeField,
+        String logFieldName,
+        String startTime,
+        String endTime,
+        List<String> errorKeywords,
+        ActionListener<List<PatternWithSamples>> listener
+    ) {
+        log.info("Fetching error logs from index {} in time range {} to {}", index, startTime, endTime);
+        
+        // Create search request
+        SearchRequest searchRequest = new SearchRequest(index);
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        
+        // Build query - time range and error keywords
+        StringBuilder queryBuilder = new StringBuilder();
+        for (int i = 0; i < errorKeywords.size(); i++) {
+            if (i > 0) queryBuilder.append(" OR ");
+            queryBuilder.append(logFieldName).append(":").append(errorKeywords.get(i));
+        }
+        
+        // Combine with time range
+        searchSourceBuilder.query(
+            QueryBuilders.boolQuery()
+                .must(QueryBuilders.rangeQuery(timeField)
+                    .from(startTime, true)
+                    .to(endTime, true))
+                .must(QueryBuilders.queryStringQuery(queryBuilder.toString()))
+        );
+        
+        searchSourceBuilder.size(MAX_LOG_FETCH_SIZE);  // Fetch a large batch
+        searchSourceBuilder.sort(timeField, SortOrder.DESC);  // Most recent first
+        searchSourceBuilder.fetchSource(new String[]{logFieldName}, null);
+        
+        searchRequest.source(searchSourceBuilder);
+        
+        // Execute search
+        client.search(searchRequest, ActionListener.wrap(searchResponse -> {
+            try {
+                Map<String, LogCluster> patternMap = new HashMap<>();
+                Map<String, List<String>> patternSamples = new HashMap<>();
+                int maxSamplesPerPattern = 2;  // Keep only 2 sample logs per pattern
+                
+                // Process logs with Drain3
+                for (SearchHit hit : searchResponse.getHits().getHits()) {
+                    Map<String, Object> source = hit.getSourceAsMap();
+                    if (source.containsKey(logFieldName)) {
+                        String logMessage = source.get(logFieldName).toString();
+                        
+                        // Process with Drain3
+                        LogCluster cluster = drain3.parseLog(logMessage);
+                        String clusterId = cluster.getClusterId();
+                        
+                        // Store cluster and samples
+                        patternMap.putIfAbsent(clusterId, cluster);
+                        
+                        // Store sample logs (up to max)
+                        List<String> samples = patternSamples.computeIfAbsent(clusterId, k -> new ArrayList<>());
+                        if (samples.size() < maxSamplesPerPattern) {
+                            samples.add(logMessage);
+                        }
+                    }
+                }
+                
+                // Convert to result format
+                List<PatternWithSamples> results = new ArrayList<>();
+                for (Map.Entry<String, LogCluster> entry : patternMap.entrySet()) {
+                    String clusterId = entry.getKey();
+                    LogCluster cluster = entry.getValue();
+                    double count = cluster.getSize();
+                    List<String> samples = patternSamples.getOrDefault(clusterId, Collections.emptyList());
+                    
+                    // Use template string for display in results
+                    results.add(new PatternWithSamples(cluster.getTemplateString(), count, samples));
+                }
+                
+                // Sort by count (descending)
+                results.sort((a, b) -> Double.compare(b.count(), a.count()));
+                
+                // Limit to top 5
+                if (results.size() > 5) {
+                    results = results.subList(0, 5);
+                }
+                
+                log.info("Processed {} error logs, found {} patterns", 
+                    searchResponse.getHits().getTotalHits().toString(), results.size());
+                
+                listener.onResponse(results);
+                
+            } catch (Exception e) {
+                log.error("Error processing error logs with Drain3", e);
+                listener.onFailure(e);
+            }
+        }, e -> {
+            log.error("Failed to fetch error logs from index {}", index, e);
+            listener.onFailure(e);
+        }));
+    }
+    
     private <T> void logInsight(AnalysisParameters params, ActionListener<T> listener) {
         List<String> errorKeywords = List
             .of(
@@ -703,38 +948,16 @@ public class LogPatternAnalysisTool implements Tool {
                 "access_violation"
             );
 
-        String selectionTimeRangeLogPatternPPL = String
-            .format(
-                "source=%s | where %s>'%s' and %s<'%s' | where match(%s, '%s') | patterns %s method=brain "
-                    + "mode=aggregation max_sample_count=2"
-                    + "variable_count_threshold=3 | fields patterns_field, pattern_count, sample_logs "
-                    + "| sort -pattern_count | head 5",
-                params.index,
-                params.timeField,
-                params.selectionTimeRangeStart,
-                params.timeField,
-                params.selectionTimeRangeEnd,
-                params.logFieldName,
-                String.join(" ", errorKeywords),
-                params.logFieldName
-            );
-
-        Function<List<List<Object>>, List<PatternWithSamples>> dataRowsParser = dataRows -> {
-            List<PatternWithSamples> patternWithSamplesList = new ArrayList<>();
-            for (List<Object> row : dataRows) {
-                if (row.size() == 3) {
-                    String pattern = (String) row.get(0);
-                    double count = ((Number) row.get(1)).doubleValue();
-                    List<?> samples = (List<?>) row.get(2);
-                    patternWithSamplesList.add(new PatternWithSamples(pattern, count, samples));
-                }
-            }
-            return patternWithSamplesList;
-        };
-
-        executePPL(selectionTimeRangeLogPatternPPL, ActionListener.wrap(baseResponse -> {
+        // Process logs with error keywords using Drain3
+        fetchErrorLogsAndProcess(
+            params.index,
+            params.timeField,
+            params.logFieldName,
+            params.selectionTimeRangeStart,
+            params.selectionTimeRangeEnd,
+            errorKeywords,
+            ActionListener.wrap(logInsights -> {
             try {
-                List<PatternWithSamples> logInsights = parseLogPatterns(baseResponse, dataRowsParser).orElse(new ArrayList<>());
                 Map<String, Object> finalResult = new HashMap<>();
                 finalResult.put("logInsights", logInsights);
                 listener.onResponse((T) gson.toJson(finalResult));
@@ -742,23 +965,12 @@ public class LogPatternAnalysisTool implements Tool {
                 log.error("Failed to process base pattern response", e);
                 listener.onFailure(new RuntimeException("Failed to process base patterns", e));
             }
-        }, this::handlePPLError));
+        }, this::handleSearchError));
     }
 
-    private String buildLogPatternPPL(String index, String timeField, String logFieldName, String startTime, String endTime) {
-        return String
-            .format(
-                "source=%s | where %s>'%s' and %s<'%s' | patterns %s method=brain "
-                    + "variable_count_threshold=3 | stats count() as cnt by patterns_field | fields cnt, patterns_field",
-                index,
-                timeField,
-                startTime,
-                timeField,
-                endTime,
-                logFieldName
-            );
-    }
-
+    /**
+     * Calculate pattern differences between baseline and selection time ranges
+     */
     private List<PatternDiff> calculatePatternDifferences(Map<String, Double> basePatterns, Map<String, Double> selectionPatterns) {
         List<PatternDiff> differences = new ArrayList<>();
 
@@ -790,224 +1002,27 @@ public class LogPatternAnalysisTool implements Tool {
         return differences;
     }
 
-    private <T> Optional<T> parseLogPatterns(String response, Function<List<List<Object>>, T> rowParser) {
-        try {
-            Map<String, Object> pplResult = gson.fromJson(response, new TypeToken<Map<String, Object>>() {
-            }.getType());
 
-            Object datarowsObj = pplResult.get("datarows");
-            if (datarowsObj == null || !(datarowsObj instanceof List)) {
-                log.warn("Invalid PPL response format: missing or invalid datarows");
-                return Optional.empty();
-            }
-
-            @SuppressWarnings("unchecked")
-            List<List<Object>> dataRows = (List<List<Object>>) datarowsObj;
-
-            return Optional.ofNullable(rowParser.apply(dataRows));
-        } catch (Exception e) {
-            log.error("Failed to parse log patterns from response", e);
-            return Optional.empty();
-        }
-    }
-
-    private void handlePPLError(Throwable error) {
-        log.error("PPL execution failed: {}", error.getMessage());
+    /**
+     * Handle search errors with appropriate exception
+     */
+    private void handleSearchError(Throwable error) {
+        log.error("OpenSearch search failed: {}", error.getMessage());
         if (error.toString().contains("IndexNotFoundException")) {
             throw new IllegalArgumentException("Index not found: " + error.getMessage(), error);
         } else {
-            throw new RuntimeException("PPL execution failed", error);
+            throw new RuntimeException("OpenSearch search failed", error);
         }
     }
 
-    private double jacCardSimilarity(String pattern1, String pattern2) {
-        if (Strings.isEmpty(pattern1) || Strings.isEmpty(pattern2)) {
-            return 0.0;
-        }
-
-        Set<String> set1 = new HashSet<>(Arrays.asList(pattern1.split("\\s+")));
-        Set<String> set2 = new HashSet<>(Arrays.asList(pattern2.split("\\s+")));
-
-        // Calculate intersection
-        Set<String> intersection = new HashSet<>(set1);
-        intersection.retainAll(set2);
-
-        // Calculate union
-        Set<String> union = new HashSet<>(set1);
-        union.addAll(set2);  // Fixed: was set1.addAll(set2) which is incorrect
-
-        if (union.isEmpty()) {
-            return 0.0;
-        }
-
-        return (double) intersection.size() / union.size();
-    }
-
+    // Using cluster IDs directly - no need for similarity comparison
     private void mergeSimilarPatterns(Map<String, Double> patternMap) {
-        if (patternMap.isEmpty()) {
-            return;
-        }
-
-        List<String> patterns = new ArrayList<>(patternMap.keySet());
-        patterns.sort(String::compareTo);
-        Set<String> removed = new HashSet<>();
-
-        for (int i = 0; i < patterns.size(); i++) {
-            String pattern1 = patterns.get(i);
-            if (removed.contains(pattern1)) {
-                continue;
-            }
-
-            for (int j = i + 1; j < patterns.size(); j++) {
-                String pattern2 = patterns.get(j);
-                if (removed.contains(pattern2)) {
-                    continue;
-                }
-
-                if (jacCardSimilarity(pattern1, pattern2) > LOG_PATTERN_THRESHOLD) {
-                    // Merge pattern2 into pattern1
-                    double count1 = patternMap.getOrDefault(pattern1, 0.0);
-                    double count2 = patternMap.getOrDefault(pattern2, 0.0);
-                    patternMap.put(pattern1, count1 + count2);
-                    patternMap.remove(pattern2);
-                    removed.add(pattern2);
-                    log.debug("Merged similar patterns: '{}' + '{}' -> '{}'", pattern1, pattern2, pattern1);
-                }
-            }
-        }
-
-        // Post-process patterns and merge those with similar processed forms
-        Map<String, String> toReplace = new HashMap<>();
-        for (String pattern : patternMap.keySet()) {
-            String processedPattern = postProcessPattern(pattern);
-            if (!processedPattern.equals(pattern)) {
-                toReplace.put(pattern, processedPattern);
-            }
-        }
-
-        for (Map.Entry<String, String> entry : toReplace.entrySet()) {
-            String originalPattern = entry.getKey();
-            String processedPattern = entry.getValue();
-            double count = patternMap.remove(originalPattern);
-            patternMap.merge(processedPattern, count, Double::sum);
-        }
-
-        log.debug("Pattern merging completed: {} patterns remaining", patternMap.size());
+        // Since we're using cluster IDs which are already unique identifiers
+        // for each log pattern cluster, we don't need to merge similar patterns
+        log.debug("Using cluster IDs directly: {} clusters", patternMap.size());
     }
 
-    private String postProcessPattern(String pattern) {
-        if (Strings.isEmpty(pattern)) {
-            return pattern;
-        }
 
-        // Replace repeated <*> with single <*> using compiled pattern
-        pattern = REPEATED_WILDCARDS_PATTERN.matcher(pattern).replaceAll("<*>");
-
-        // Merge repeated substrings
-        // pattern = mergeRepeatedSubstrings(pattern);
-
-        return pattern;
-    }
-
-    private String mergeRepeatedSubstrings(String input) {
-        if (Strings.isEmpty(input)) {
-            return input;
-        }
-
-        List<String> tokens = new ArrayList<>(Arrays.asList(input.split("\\s+")));
-        if (tokens.size() <= 1) {
-            return input;
-        }
-
-        List<String> result = new ArrayList<>();
-        int i = 0;
-
-        while (i < tokens.size()) {
-            int maxSeqLen = 1;
-            int maxRepeatCount = 1;
-            int maxPossibleSeqLen = (tokens.size() - i) / 2;
-
-            // Find the longest repeated sequence starting at position i
-            for (int seqLen = 1; seqLen <= maxPossibleSeqLen; seqLen++) {
-                int repeatCount = 1;
-
-                while (true) {
-                    int start1 = i;
-                    int start2 = i + repeatCount * seqLen;
-
-                    if (start2 + seqLen > tokens.size()) {
-                        break;
-                    }
-
-                    boolean match = true;
-                    for (int k = 0; k < seqLen; k++) {
-                        if (!tokens.get(start1 + k).equals(tokens.get(start2 + k))) {
-                            match = false;
-                            break;
-                        }
-                    }
-
-                    if (match) {
-                        repeatCount++;
-                    } else {
-                        break;
-                    }
-                }
-
-                if (repeatCount > 1 && repeatCount > maxRepeatCount) {
-                    maxRepeatCount = repeatCount;
-                    maxSeqLen = seqLen;
-                }
-            }
-
-            // Add the sequence once (removing repetitions)
-            for (int k = 0; k < maxSeqLen; k++) {
-                result.add(tokens.get(i + k));
-            }
-
-            // Skip all repeated sequences
-            i += maxSeqLen * maxRepeatCount;
-        }
-
-        return String.join(" ", result);
-    }
-
-    private void executePPL(String ppl, ActionListener<String> listener) {
-        try {
-            JSONObject jsonContent = new JSONObject(ImmutableMap.of("query", ppl));
-            PPLQueryRequest pplQueryRequest = new PPLQueryRequest(ppl, jsonContent, null, "jdbc");
-            TransportPPLQueryRequest transportPPLQueryRequest = new TransportPPLQueryRequest(pplQueryRequest);
-
-            client
-                .execute(
-                    PPLQueryAction.INSTANCE,
-                    transportPPLQueryRequest,
-                    getPPLTransportActionListener(ActionListener.wrap(transportPPLQueryResponse -> {
-                        String result = transportPPLQueryResponse.getResult();
-                        if (Strings.isEmpty(result)) {
-                            listener.onFailure(new RuntimeException("Empty PPL response"));
-                        } else {
-                            listener.onResponse(result);
-                        }
-                    }, error -> {
-                        String errorMessage = String.format("PPL execution failed for query: %s, error: %s", ppl, error.getMessage());
-                        log.error(errorMessage, error);
-                        listener.onFailure(new RuntimeException(errorMessage, error));
-                    }))
-                );
-        } catch (Exception e) {
-            String errorMessage = String.format("Failed to execute PPL query: %s", ppl);
-            log.error(errorMessage, e);
-            listener.onFailure(new RuntimeException(errorMessage, e));
-        }
-    }
-
-    /**
-     * Clusters log vectors using hierarchical agglomerative clustering and returns representative centroids.
-     *
-     * @param logVectors Map of trace IDs to their corresponding log vectors
-     * @return List of trace IDs representing the centroids of each cluster
-     */
     /**
      * Cluster log vectors using a two-phase approach:
      * 1. K-means clustering to split large datasets into smaller groups (500-1000 data points each)
