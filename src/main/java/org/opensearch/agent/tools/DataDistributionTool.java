@@ -113,7 +113,7 @@ public class DataDistributionTool implements Tool {
     public static final String STRICT_FIELD = "strict";
 
     private static final String DEFAULT_DESCRIPTION =
-        "This tool analyzes data distribution differences between time ranges or provides single dataset insights.";
+        "Analyzes field value distributions in OpenSearch data. Supports single dataset analysis or comparative analysis between two time periods (selection vs baseline). Works with categorical and numeric fields to identify significant distribution changes and return top field value distributions.";
     private static final String DEFAULT_TIME_FIELD = "@timestamp";
 
     private static final String PARAM_INDEX = "index";
