@@ -22,6 +22,7 @@ import org.opensearch.agent.tools.RAGTool;
 import org.opensearch.agent.tools.SearchAlertsTool;
 import org.opensearch.agent.tools.SearchAnomalyDetectorsTool;
 import org.opensearch.agent.tools.SearchAnomalyResultsTool;
+import org.opensearch.agent.tools.SearchAroundDocumentTool;
 import org.opensearch.agent.tools.SearchMonitorsTool;
 import org.opensearch.agent.tools.VectorDBTool;
 import org.opensearch.agent.tools.WebSearchTool;
@@ -102,6 +103,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlug
         WebSearchTool.Factory.getInstance().init(threadPool);
         LogPatternAnalysisTool.Factory.getInstance().init(client);
         DataDistributionTool.Factory.getInstance().init(client);
+        SearchAroundDocumentTool.Factory.getInstance().init(client, xContentRegistry);
         return Collections.emptyList();
     }
 
@@ -122,7 +124,8 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlug
                 LogPatternTool.Factory.getInstance(),
                 WebSearchTool.Factory.getInstance(),
                 LogPatternAnalysisTool.Factory.getInstance(),
-                DataDistributionTool.Factory.getInstance()
+                DataDistributionTool.Factory.getInstance(),
+                SearchAroundDocumentTool.Factory.getInstance()
             );
     }
 
