@@ -237,7 +237,8 @@ public class DataDistributionTool implements Tool {
             this.baselineTimeRangeEnd = parameters.getOrDefault(PARAM_BASELINE_TIME_RANGE_END, "");
 
             try {
-                this.size = Integer.parseInt(parameters.getOrDefault(PARAM_SIZE, DEFAULT_SIZE));
+                // handle 1000.0
+                this.size = Double.valueOf(parameters.getOrDefault(PARAM_SIZE, DEFAULT_SIZE)).intValue();
                 if (this.size > MAX_SIZE_LIMIT) {
                     throw new IllegalArgumentException("Size parameter exceeds maximum limit of " + MAX_SIZE_LIMIT + ", got: " + this.size);
                 }

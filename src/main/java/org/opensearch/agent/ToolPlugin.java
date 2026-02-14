@@ -16,6 +16,7 @@ import org.opensearch.agent.tools.CreateAnomalyDetectorTool;
 import org.opensearch.agent.tools.DataDistributionTool;
 import org.opensearch.agent.tools.LogPatternAnalysisTool;
 import org.opensearch.agent.tools.LogPatternTool;
+import org.opensearch.agent.tools.MetricsInsightTool;
 import org.opensearch.agent.tools.NeuralSparseSearchTool;
 import org.opensearch.agent.tools.PPLTool;
 import org.opensearch.agent.tools.RAGTool;
@@ -103,6 +104,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlug
         WebSearchTool.Factory.getInstance().init(threadPool);
         LogPatternAnalysisTool.Factory.getInstance().init(client);
         DataDistributionTool.Factory.getInstance().init(client);
+        MetricsInsightTool.Factory.getInstance().init(client);
         SearchAroundDocumentTool.Factory.getInstance().init(client, xContentRegistry);
         return Collections.emptyList();
     }
@@ -125,6 +127,7 @@ public class ToolPlugin extends Plugin implements MLCommonsExtension, ActionPlug
                 WebSearchTool.Factory.getInstance(),
                 LogPatternAnalysisTool.Factory.getInstance(),
                 DataDistributionTool.Factory.getInstance(),
+                MetricsInsightTool.Factory.getInstance(),
                 SearchAroundDocumentTool.Factory.getInstance()
             );
     }
