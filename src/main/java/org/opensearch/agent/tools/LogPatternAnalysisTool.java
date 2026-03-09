@@ -138,6 +138,10 @@ public class LogPatternAnalysisTool implements Tool {
                 "selectionTimeRangeEnd": {
                     "type": "string",
                     "description": "End of target/incident period (format: yyyy-MM-dd HH:mm:ss)"
+                },
+                "filter": {
+                    "type": "string",
+                    "description": "PPL boolean expression to filter logs (e.g. serviceName='ts-auth-service' or severity='ERROR'). Applied as additional where clause"
                 }
             },
             "required": [
@@ -169,6 +173,7 @@ public class LogPatternAnalysisTool implements Tool {
         final String baseTimeRangeEnd;
         final String selectionTimeRangeStart;
         final String selectionTimeRangeEnd;
+        final String filter;
 
         AnalysisParameters(Map<String, String> parameters) {
             this.index = parameters.getOrDefault("index", "");
@@ -179,6 +184,7 @@ public class LogPatternAnalysisTool implements Tool {
             this.baseTimeRangeEnd = parameters.getOrDefault("baseTimeRangeEnd", "");
             this.selectionTimeRangeStart = parameters.getOrDefault("selectionTimeRangeStart", "");
             this.selectionTimeRangeEnd = parameters.getOrDefault("selectionTimeRangeEnd", "");
+            this.filter = parameters.getOrDefault("filter", "");
         }
 
         private void validate() {
@@ -338,7 +344,8 @@ public class LogPatternAnalysisTool implements Tool {
             params.logFieldName,
             params.traceFieldName,
             params.baseTimeRangeStart,
-            params.baseTimeRangeEnd
+            params.baseTimeRangeEnd,
+            params.filter
         );
 
         executePPL(baseTimeRangeLogPatternPPL, listener);
@@ -351,7 +358,8 @@ public class LogPatternAnalysisTool implements Tool {
             params.logFieldName,
             params.traceFieldName,
             params.selectionTimeRangeStart,
-            params.selectionTimeRangeEnd
+            params.selectionTimeRangeEnd,
+            params.filter
         );
 
         executePPL(selectionTimeRangeLogPatternPPL, listener);
@@ -392,12 +400,14 @@ public class LogPatternAnalysisTool implements Tool {
         String logFieldName,
         String traceFieldName,
         String startTime,
-        String endTime
+        String endTime,
+        String filter
     ) {
+        String filterClause = Strings.isEmpty(filter) ? "" : String.format(Locale.ROOT, " | where %s", filter);
         return String
             .format(
                 Locale.ROOT,
-                "source=%s | where %s!='' | where %s>'%s' and %s<'%s' | patterns %s method=brain "
+                "source=%s | where %s!='' | where %s>'%s' and %s<'%s'%s | patterns %s method=brain "
                     + "variable_count_threshold=3 | fields %s, patterns_field, %s | sort %s",
                 index,
                 traceFieldName,
@@ -405,6 +415,7 @@ public class LogPatternAnalysisTool implements Tool {
                 startTime,
                 timeField,
                 endTime,
+                filterClause,
                 logFieldName,
                 traceFieldName,
                 timeField,
@@ -620,7 +631,8 @@ public class LogPatternAnalysisTool implements Tool {
             params.timeField,
             params.logFieldName,
             params.baseTimeRangeStart,
-            params.baseTimeRangeEnd
+            params.baseTimeRangeEnd,
+            params.filter
         );
         Function<List<List<Object>>, Map<String, Double>> dataRowsParser = dataRows -> {
             Map<String, Double> patternMap = new HashMap<>();
@@ -652,7 +664,8 @@ public class LogPatternAnalysisTool implements Tool {
                             params.timeField,
                             params.logFieldName,
                             params.selectionTimeRangeStart,
-                            params.selectionTimeRangeEnd
+                            params.selectionTimeRangeEnd,
+                            params.filter
                         );
 
                         log.debug("Executing selection time range pattern PPL: {}", selectionTimeRangeLogPatternPPL);
@@ -753,10 +766,11 @@ public class LogPatternAnalysisTool implements Tool {
                 "violation"
             );
 
+        String filterClause = Strings.isEmpty(params.filter) ? "" : String.format(Locale.ROOT, " | where %s", params.filter);
         String selectionTimeRangeLogPatternPPL = String
             .format(
                 Locale.ROOT,
-                "source=%s | where %s>'%s' and %s<'%s' | where match(%s, '%s') | patterns %s method=brain "
+                "source=%s | where %s>'%s' and %s<'%s'%s | where match(%s, '%s') | patterns %s method=brain "
                     + "mode=aggregation max_sample_count=5 "
                     + "variable_count_threshold=3 | fields patterns_field, pattern_count, sample_logs "
                     + "| sort -pattern_count | head 5",
@@ -765,6 +779,7 @@ public class LogPatternAnalysisTool implements Tool {
                 params.selectionTimeRangeStart,
                 params.timeField,
                 params.selectionTimeRangeEnd,
+                filterClause,
                 params.logFieldName,
                 String.join(" ", errorKeywords),
                 params.logFieldName
@@ -804,17 +819,19 @@ public class LogPatternAnalysisTool implements Tool {
             );
     }
 
-    private String buildLogPatternPPL(String index, String timeField, String logFieldName, String startTime, String endTime) {
+    private String buildLogPatternPPL(String index, String timeField, String logFieldName, String startTime, String endTime, String filter) {
+        String filterClause = Strings.isEmpty(filter) ? "" : String.format(Locale.ROOT, " | where %s", filter);
         return String
             .format(
                 Locale.ROOT,
-                "source=%s | where %s>'%s' and %s<'%s' | patterns %s method=brain mode=aggregation "
+                "source=%s | where %s>'%s' and %s<'%s'%s | patterns %s method=brain mode=aggregation "
                     + "variable_count_threshold=3 | fields pattern_count, patterns_field",
                 index,
                 timeField,
                 startTime,
                 timeField,
                 endTime,
+                filterClause,
                 logFieldName
             );
     }
