@@ -9,6 +9,10 @@ import static org.opensearch.agent.tools.utils.clustering.HierarchicalAgglomerat
 import static org.opensearch.ml.common.CommonValue.TOOL_INPUT_SCHEMA_FIELD;
 import static org.opensearch.ml.common.utils.StringUtils.gson;
 
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -102,6 +106,52 @@ public class LogPatternAnalysisTool implements Tool {
     private static final double LOG_PATTERN_THRESHOLD = 0.75;
     private static final double LOG_PATTERN_LIFT = 3;
     private static final String DEFAULT_TIME_FIELD = "@timestamp";
+    private static final String DEFAULT_HISTOGRAM_INTERVAL = "15m";
+    private static final DateTimeFormatter DATETIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
+    private static final Set<String> ERROR_KEYWORDS = Set
+        .of(
+            "error",
+            "err",
+            "exception",
+            "failed",
+            "failure",
+            "timeout",
+            "panic",
+            "fatal",
+            "critical",
+            "severe",
+            "abort",
+            "aborted",
+            "aborting",
+            "crash",
+            "crashed",
+            "broken",
+            "corrupt",
+            "corrupted",
+            "invalid",
+            "malformed",
+            "unprocessable",
+            "denied",
+            "forbidden",
+            "unauthorized",
+            "conflict",
+            "deadlock",
+            "overflow",
+            "underflow",
+            "throttled",
+            "disk_full",
+            "insufficient",
+            "retrying",
+            "backpressure",
+            "degraded",
+            "unexpected",
+            "unusual",
+            "missing",
+            "stale",
+            "expired",
+            "mismatch",
+            "violation"
+        );
 
     public static final String DEFAULT_INPUT_SCHEMA = """
         {
@@ -238,6 +288,9 @@ public class LogPatternAnalysisTool implements Tool {
     };
 
     private record PatternWithSamples(String pattern, double count, List<?> sampleLogs) {
+    }
+
+    private record HistogramBucket(String timeBucket, String pattern, double count) {
     }
 
     // Instance fields
@@ -720,52 +773,45 @@ public class LogPatternAnalysisTool implements Tool {
             );
     }
 
-    private <T> void logInsight(AnalysisParameters params, ActionListener<T> listener) {
-        Set<String> errorKeywords = Set
-            .of(
-                "error",
-                "err",
-                "exception",
-                "failed",
-                "failure",
-                "timeout",
-                "panic",
-                "fatal",
-                "critical",
-                "severe",
-                "abort",
-                "aborted",
-                "aborting",
-                "crash",
-                "crashed",
-                "broken",
-                "corrupt",
-                "corrupted",
-                "invalid",
-                "malformed",
-                "unprocessable",
-                "denied",
-                "forbidden",
-                "unauthorized",
-                "conflict",
-                "deadlock",
-                "overflow",
-                "underflow",
-                "throttled",
-                "disk_full",
-                "insufficient",
-                "retrying",
-                "backpressure",
-                "degraded",
-                "unexpected",
-                "unusual",
-                "missing",
-                "stale",
-                "expired",
-                "mismatch",
-                "violation"
-            );
+    private static final int MAX_HISTOGRAM_BUCKETS = 20;
 
+    static String calculateHistogramInterval(String startTime, String endTime) {
+        try {
+            LocalDateTime start = LocalDateTime.parse(startTime, DATETIME_FORMATTER);
+            LocalDateTime end = LocalDateTime.parse(endTime, DATETIME_FORMATTER);
+            long minutes = Duration.between(start, end).toMinutes();
+            long interval = Math.max(1, (minutes + MAX_HISTOGRAM_BUCKETS - 1) / MAX_HISTOGRAM_BUCKETS);
+            return interval + "m";
+        } catch (DateTimeParseException e) {
+            log.warn("Failed to parse time range for histogram interval, using default: {}", e.getMessage());
+            return DEFAULT_HISTOGRAM_INTERVAL;
+        }
+    }
+
+    private String buildHistogramPPL(AnalysisParameters params, String interval) {
+        String filterClause = Strings.isEmpty(params.filter) ? "" : String.format(Locale.ROOT, " | where %s", params.filter);
+        return String
+            .format(
+                Locale.ROOT,
+                "source=%s | where %s>'%s' and %s<'%s'%s | where match(%s, '%s') | patterns %s method=brain "
+                    + "variable_count_threshold=3 "
+                    + "| stats count() as cnt by SPAN(%s, %s) as time_bucket, patterns_field "
+                    + "| sort time_bucket",
+                params.index,
+                params.timeField,
+                params.selectionTimeRangeStart,
+                params.timeField,
+                params.selectionTimeRangeEnd,
+                filterClause,
+                params.logFieldName,
+                String.join(" ", ERROR_KEYWORDS),
+                params.logFieldName,
+                params.timeField,
+                interval
+            );
+    }
+
+    private <T> void logInsight(AnalysisParameters params, ActionListener<T> listener) {
         String filterClause = Strings.isEmpty(params.filter) ? "" : String.format(Locale.ROOT, " | where %s", params.filter);
         String selectionTimeRangeLogPatternPPL = String
             .format(
@@ -781,7 +827,7 @@ public class LogPatternAnalysisTool implements Tool {
                 params.selectionTimeRangeEnd,
                 filterClause,
                 params.logFieldName,
-                String.join(" ", errorKeywords),
+                String.join(" ", ERROR_KEYWORDS),
                 params.logFieldName
             );
 
@@ -805,12 +851,56 @@ public class LogPatternAnalysisTool implements Tool {
                 PPLExecuteHelper.dataRowsParser(dataRowsParser),
                 ActionListener.wrap(logInsights -> {
                     try {
-                        Map<String, Object> finalResult = new HashMap<>();
-                        finalResult.put("logInsights", logInsights);
-                        listener.onResponse((T) gson.toJson(finalResult));
+                        String interval = calculateHistogramInterval(params.selectionTimeRangeStart, params.selectionTimeRangeEnd);
+                        String histogramPPL = buildHistogramPPL(params, interval);
+
+                        Function<List<List<Object>>, List<HistogramBucket>> histogramParser = dataRows -> {
+                            List<HistogramBucket> buckets = new ArrayList<>();
+                            for (List<Object> row : dataRows) {
+                                if (row.size() == 3) {
+                                    double cnt = ((Number) row.get(0)).doubleValue();
+                                    String timeBucket = String.valueOf(row.get(1));
+                                    String pattern = (String) row.get(2);
+                                    buckets.add(new HistogramBucket(timeBucket, pattern, cnt));
+                                }
+                            }
+                            return buckets;
+                        };
+
+                        PPLExecuteHelper
+                            .executePPLAndParseResult(
+                                client,
+                                histogramPPL,
+                                PPLExecuteHelper.dataRowsParser(histogramParser),
+                                ActionListener.wrap(histogram -> {
+                                    try {
+                                        Map<String, Object> finalResult = new HashMap<>();
+                                        finalResult.put("logInsights", logInsights);
+                                        finalResult.put("histogram", histogram);
+                                        finalResult.put("histogramInterval", interval);
+                                        listener.onResponse((T) gson.toJson(finalResult));
+                                    } catch (Exception e) {
+                                        log.error("Failed to build logInsight result", e);
+                                        listener
+                                            .onFailure(new RuntimeException("Failed to build logInsight result: " + e.getMessage(), e));
+                                    }
+                                }, histogramError -> {
+                                    log.warn("Histogram query failed, returning logInsights without histogram: {}", histogramError.getMessage());
+                                    try {
+                                        Map<String, Object> finalResult = new HashMap<>();
+                                        finalResult.put("logInsights", logInsights);
+                                        finalResult.put("histogram", List.of());
+                                        finalResult.put("histogramInterval", interval);
+                                        listener.onResponse((T) gson.toJson(finalResult));
+                                    } catch (Exception e) {
+                                        log.error("Failed to build logInsight result after histogram failure", e);
+                                        listener.onFailure(new RuntimeException("Failed to build logInsight result: " + e.getMessage(), e));
+                                    }
+                                })
+                            );
                     } catch (Exception e) {
-                        log.error("Failed to process base pattern response", e);
-                        listener.onFailure(new RuntimeException("Failed to process base patterns: " + e.getMessage(), e));
+                        log.error("Failed to process logInsight response", e);
+                        listener.onFailure(new RuntimeException("Failed to process logInsight response: " + e.getMessage(), e));
                     }
                 }, error -> {
                     log.error("Failed to execute log insights analysis", error);

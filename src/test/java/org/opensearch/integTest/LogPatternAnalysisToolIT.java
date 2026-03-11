@@ -6,6 +6,7 @@
 package org.opensearch.integTest;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.opensearch.ml.common.utils.StringUtils.gson;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -15,6 +16,9 @@ import java.util.Locale;
 import org.hamcrest.MatcherAssert;
 import org.junit.After;
 import org.junit.Before;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 
 import lombok.SneakyThrows;
 
@@ -123,6 +127,9 @@ public class LogPatternAnalysisToolIT extends BaseAgentToolsIT {
 
     @SneakyThrows
     public void testLogPatternAnalysisToolLogInsight() {
+        // Test data in selection range 10:00-10:05 with error keywords:
+        //   doc "3": 10:02:00 "Error connection timeout failed" (db-service)
+        //   doc "5": 10:04:00 "Exception in authentication service" (auth-service)
         String result = executeAgent(
             agentId,
             String
@@ -133,7 +140,39 @@ public class LogPatternAnalysisToolIT extends BaseAgentToolsIT {
                 )
         );
         assertNotNull(result);
-        assertTrue(result.contains("logInsights"));
+        JsonObject json = gson.fromJson(result, JsonObject.class);
+
+        // Verify logInsights: 2 error docs should produce patterns with total count = 2
+        JsonArray logInsights = json.getAsJsonArray("logInsights");
+        assertNotNull(logInsights);
+        assertFalse("Expected at least one error pattern", logInsights.isEmpty());
+        double insightsTotalCount = 0;
+        for (int i = 0; i < logInsights.size(); i++) {
+            JsonObject insight = logInsights.get(i).getAsJsonObject();
+            assertFalse("Pattern should not be empty", insight.get("pattern").getAsString().isEmpty());
+            assertTrue("Each pattern count should be > 0", insight.get("count").getAsDouble() > 0);
+            assertNotNull("Sample logs should be present", insight.getAsJsonArray("sampleLogs"));
+            assertFalse("Sample logs should not be empty", insight.getAsJsonArray("sampleLogs").isEmpty());
+            insightsTotalCount += insight.get("count").getAsDouble();
+        }
+        assertEquals("Total logInsights count should match 2 error docs", 2.0, insightsTotalCount, 0.01);
+
+        // Verify histogram: same 2 error docs bucketed by time
+        JsonArray histogram = json.getAsJsonArray("histogram");
+        assertNotNull(histogram);
+        assertFalse("Expected at least one histogram bucket", histogram.isEmpty());
+        double histogramTotalCount = 0;
+        for (int i = 0; i < histogram.size(); i++) {
+            JsonObject bucket = histogram.get(i).getAsJsonObject();
+            assertFalse("Bucket timeBucket should not be empty", bucket.get("timeBucket").getAsString().isEmpty());
+            assertFalse("Bucket pattern should not be empty", bucket.get("pattern").getAsString().isEmpty());
+            assertTrue("Bucket count should be > 0", bucket.get("count").getAsDouble() > 0);
+            histogramTotalCount += bucket.get("count").getAsDouble();
+        }
+        assertEquals("Total histogram count should match 2 error docs", 2.0, histogramTotalCount, 0.01);
+
+        // 5min range → ceil(5/20) = 1m
+        assertEquals("1m", json.get("histogramInterval").getAsString());
     }
 
     @SneakyThrows
@@ -211,17 +250,45 @@ public class LogPatternAnalysisToolIT extends BaseAgentToolsIT {
 
     @SneakyThrows
     public void testLogPatternAnalysisToolLogInsightWithFilter() {
+        // With filter serviceName='db-service', only 1 error doc matches:
+        //   doc "3": 10:02:00 "Error connection timeout failed" (db-service)
         String result = executeAgent(
             agentId,
-            String
-                .format(
-                    Locale.ROOT,
-                    "{\"parameters\": {\"index\": \"%s\", \"timeField\": \"@timestamp\", \"logFieldName\": \"message\", \"selectionTimeRangeStart\": \"2025-01-01 10:00:00\", \"selectionTimeRangeEnd\": \"2025-01-01 10:05:00\", \"filter\": \"serviceName='db-service'\"}}",
-                    TEST_LOG_INDEX_NAME
-                )
+            """
+                {"parameters": {"index": "%s", "timeField": "@timestamp", "logFieldName": "message", \
+                "selectionTimeRangeStart": "2025-01-01 10:00:00", "selectionTimeRangeEnd": "2025-01-01 10:05:00", \
+                "filter": "serviceName='db-service'"}}"""
+                .formatted(TEST_LOG_INDEX_NAME)
         );
         assertNotNull(result);
-        assertTrue(result.contains("logInsights"));
+        JsonObject json = gson.fromJson(result, JsonObject.class);
+
+        // Verify logInsights: only 1 error doc from db-service
+        JsonArray logInsights = json.getAsJsonArray("logInsights");
+        assertNotNull(logInsights);
+        assertFalse("Expected at least one error pattern from db-service", logInsights.isEmpty());
+        double insightsTotalCount = 0;
+        for (int i = 0; i < logInsights.size(); i++) {
+            JsonObject insight = logInsights.get(i).getAsJsonObject();
+            assertFalse("Pattern should not be empty", insight.get("pattern").getAsString().isEmpty());
+            insightsTotalCount += insight.get("count").getAsDouble();
+        }
+        assertEquals("Total logInsights count should match 1 filtered error doc", 1.0, insightsTotalCount, 0.01);
+
+        // Verify histogram: same 1 error doc bucketed by time
+        JsonArray histogram = json.getAsJsonArray("histogram");
+        assertNotNull(histogram);
+        double histogramTotalCount = 0;
+        for (int i = 0; i < histogram.size(); i++) {
+            JsonObject bucket = histogram.get(i).getAsJsonObject();
+            assertFalse("Bucket timeBucket should not be empty", bucket.get("timeBucket").getAsString().isEmpty());
+            assertFalse("Bucket pattern should not be empty", bucket.get("pattern").getAsString().isEmpty());
+            histogramTotalCount += bucket.get("count").getAsDouble();
+        }
+        assertEquals("Total histogram count should match 1 filtered error doc", 1.0, histogramTotalCount, 0.01);
+
+        // 5min range → ceil(5/20) = 1m
+        assertEquals("1m", json.get("histogramInterval").getAsString());
     }
 
     @SneakyThrows

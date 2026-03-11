@@ -18,7 +18,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.opensearch.ml.common.utils.StringUtils.gson;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -111,28 +113,43 @@ public class LogPatternAnalysisToolTests {
                 "total":2,"size":2}
                 """;
 
-        mockPPLInvocation(pplResponse);
+        String histogramResponse =
+            """
+                {"schema":[{"name":"cnt","type":"long"},{"name":"time_bucket","type":"timestamp"},{"name":"patterns_field","type":"string"}],
+                "datarows":[[3,"2025-06-24 07:50:00","Error in processing <*>"],[2,"2025-06-24 07:55:00","Error in processing <*>"]],
+                "total":2,"size":2}
+                """;
+
+        doAnswer(invocation -> {
+            ActionListener<TransportPPLQueryResponse> listener = (ActionListener<TransportPPLQueryResponse>) invocation.getArguments()[2];
+            listener.onResponse(pplQueryResponse);
+            return null;
+        }).when(client).execute(eq(PPLQueryAction.INSTANCE), any(), any());
+
+        when(pplQueryResponse.getResult())
+            .thenReturn(pplResponse)
+            .thenReturn(histogramResponse);
+
         LogPatternAnalysisTool tool = LogPatternAnalysisTool.Factory.getInstance().create(params);
 
         tool
             .run(
                 ImmutableMap
-                    .of(
-                        "index",
-                        "test_index",
-                        "timeField",
-                        "@timestamp",
-                        "logFieldName",
-                        "message",
-                        "selectionTimeRangeStart",
-                        "2025-01-01T00:00:00Z",
-                        "selectionTimeRangeEnd",
-                        "2025-01-01T01:00:00Z"
-                    ),
+                    .<String, String>builder()
+                    .put("index", "test_index")
+                    .put("timeField", "@timestamp")
+                    .put("logFieldName", "message")
+                    .put("selectionTimeRangeStart", "2025-06-24 07:50:00")
+                    .put("selectionTimeRangeEnd", "2025-06-24 07:55:00")
+                    .build(),
                 ActionListener.<String>wrap(response -> {
                     System.out.println(response);
                     JsonElement result = gson.fromJson(response, JsonElement.class);
                     assertTrue(result.getAsJsonObject().has("logInsights"));
+                    assertTrue(result.getAsJsonObject().has("histogram"));
+                    assertTrue(result.getAsJsonObject().has("histogramInterval"));
+                    assertEquals("1m", result.getAsJsonObject().get("histogramInterval").getAsString());
+                    assertEquals(2, result.getAsJsonObject().getAsJsonArray("histogram").size());
                 }, e -> fail("Tool execution failed: " + e.getMessage()))
             );
     }
@@ -280,28 +297,32 @@ public class LogPatternAnalysisToolTests {
             {"schema":[],"datarows":[],"total":0,"size":0}
             """;
 
-        mockPPLInvocation(emptyResponse);
+        // Both the pattern query and histogram query return empty results
+        doAnswer(invocation -> {
+            ActionListener<TransportPPLQueryResponse> listener = (ActionListener<TransportPPLQueryResponse>) invocation.getArguments()[2];
+            listener.onResponse(pplQueryResponse);
+            return null;
+        }).when(client).execute(eq(PPLQueryAction.INSTANCE), any(), any());
+        when(pplQueryResponse.getResult()).thenReturn(emptyResponse);
+
         LogPatternAnalysisTool tool = LogPatternAnalysisTool.Factory.getInstance().create(params);
 
         tool
             .run(
                 ImmutableMap
-                    .of(
-                        "index",
-                        "test_index",
-                        "timeField",
-                        "@timestamp",
-                        "logFieldName",
-                        "message",
-                        "selectionTimeRangeStart",
-                        "2025-01-01T00:00:00Z",
-                        "selectionTimeRangeEnd",
-                        "2025-01-01T01:00:00Z"
-                    ),
+                    .<String, String>builder()
+                    .put("index", "test_index")
+                    .put("timeField", "@timestamp")
+                    .put("logFieldName", "message")
+                    .put("selectionTimeRangeStart", "2025-06-24 07:50:00")
+                    .put("selectionTimeRangeEnd", "2025-06-24 07:55:00")
+                    .build(),
                 ActionListener.<String>wrap(response -> {
                     System.out.println("response: " + response);
                     JsonElement result = gson.fromJson(response, JsonElement.class);
                     assertTrue(result.getAsJsonObject().has("logInsights"));
+                    assertTrue(result.getAsJsonObject().has("histogram"));
+                    assertTrue(result.getAsJsonObject().has("histogramInterval"));
                 }, e -> fail("Tool execution failed: " + e.getMessage()))
             );
     }
@@ -478,15 +499,24 @@ public class LogPatternAnalysisToolTests {
                 "total":1,"size":1}
                 """;
 
-        AtomicReference<String> capturedPPL = new AtomicReference<>();
+        String histogramResponse =
+            """
+                {"schema":[{"name":"cnt","type":"long"},{"name":"time_bucket","type":"timestamp"},{"name":"patterns_field","type":"string"}],
+                "datarows":[[3,"2025-06-24 07:50:00","Auth error for user <*>"]],
+                "total":1,"size":1}
+                """;
+
+        List<String> capturedPPLs = new ArrayList<>();
         doAnswer(invocation -> {
             TransportPPLQueryRequest request = (TransportPPLQueryRequest) invocation.getArguments()[1];
-            capturedPPL.set(request.getRequest());
+            capturedPPLs.add(request.getRequest());
             ActionListener<TransportPPLQueryResponse> listener = (ActionListener<TransportPPLQueryResponse>) invocation.getArguments()[2];
             listener.onResponse(pplQueryResponse);
             return null;
         }).when(client).execute(eq(PPLQueryAction.INSTANCE), any(), any());
-        when(pplQueryResponse.getResult()).thenReturn(pplResponse);
+        when(pplQueryResponse.getResult())
+            .thenReturn(pplResponse)
+            .thenReturn(histogramResponse);
 
         LogPatternAnalysisTool tool = LogPatternAnalysisTool.Factory.getInstance().create(params);
 
@@ -497,15 +527,18 @@ public class LogPatternAnalysisToolTests {
                     .put("index", "test_index")
                     .put("timeField", "@timestamp")
                     .put("logFieldName", "message")
-                    .put("selectionTimeRangeStart", "2025-01-01T00:00:00Z")
-                    .put("selectionTimeRangeEnd", "2025-01-01T01:00:00Z")
+                    .put("selectionTimeRangeStart", "2025-06-24 07:50:00")
+                    .put("selectionTimeRangeEnd", "2025-06-24 07:55:00")
                     .put("filter", "serviceName='ts-auth-service'")
                     .build(),
                 ActionListener.<String>wrap(response -> {
                     JsonElement result = gson.fromJson(response, JsonElement.class);
                     assertTrue(result.getAsJsonObject().has("logInsights"));
-                    // Verify the PPL query contains the filter clause
-                    assertTrue(capturedPPL.get().contains("where serviceName='ts-auth-service'"));
+                    assertTrue(result.getAsJsonObject().has("histogram"));
+                    // Verify both PPL queries contain the filter clause
+                    assertEquals(2, capturedPPLs.size());
+                    assertTrue(capturedPPLs.get(0).contains("where serviceName='ts-auth-service'"));
+                    assertTrue(capturedPPLs.get(1).contains("where serviceName='ts-auth-service'"));
                 }, e -> fail("Tool execution failed: " + e.getMessage()))
             );
     }
@@ -566,6 +599,119 @@ public class LogPatternAnalysisToolTests {
                     assertTrue(firstPPL.get().contains("where severity='ERROR'"));
                     assertTrue(secondPPL.get().contains("where severity='ERROR'"));
                 }, e -> fail("Tool execution failed: " + e.getMessage()))
+            );
+    }
+
+    @Test
+    public void testCalculateHistogramInterval() {
+        // 5min → ceil(5/20)=1m
+        assertEquals("1m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 07:50:00", "2025-06-24 07:55:00"));
+        // 20min → ceil(20/20)=1m
+        assertEquals("1m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 07:00:00", "2025-06-24 07:20:00"));
+        // 30min → ceil(30/20)=2m
+        assertEquals("2m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 07:00:00", "2025-06-24 07:30:00"));
+        // 1h → ceil(60/20)=3m
+        assertEquals("3m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 07:00:00", "2025-06-24 08:00:00"));
+        // 3h → ceil(180/20)=9m
+        assertEquals("9m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 07:00:00", "2025-06-24 10:00:00"));
+        // 12h → ceil(720/20)=36m
+        assertEquals("36m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 00:00:00", "2025-06-24 12:00:00"));
+        // 3d → ceil(4320/20)=216m
+        assertEquals("216m", LogPatternAnalysisTool.calculateHistogramInterval("2025-06-24 00:00:00", "2025-06-27 00:00:00"));
+        // Unparseable → default 15m
+        assertEquals("15m", LogPatternAnalysisTool.calculateHistogramInterval("invalid", "also-invalid"));
+    }
+
+    @Test
+    @SneakyThrows
+    public void testLogInsightHistogramEmpty() {
+        String pplResponse =
+            """
+                {"schema":[{"name":"patterns_field","type":"string"},{"name":"pattern_count","type":"long"},{"name":"sample_logs","type":"array"}],
+                "datarows":[["Error in processing <*>",5,["Error in processing request","Error in processing data"]]],
+                "total":1,"size":1}
+                """;
+
+        String emptyHistogramResponse = """
+            {"schema":[],"datarows":[],"total":0,"size":0}
+            """;
+
+        doAnswer(invocation -> {
+            ActionListener<TransportPPLQueryResponse> listener = (ActionListener<TransportPPLQueryResponse>) invocation.getArguments()[2];
+            listener.onResponse(pplQueryResponse);
+            return null;
+        }).when(client).execute(eq(PPLQueryAction.INSTANCE), any(), any());
+
+        when(pplQueryResponse.getResult())
+            .thenReturn(pplResponse)
+            .thenReturn(emptyHistogramResponse);
+
+        LogPatternAnalysisTool tool = LogPatternAnalysisTool.Factory.getInstance().create(params);
+
+        tool
+            .run(
+                ImmutableMap
+                    .<String, String>builder()
+                    .put("index", "test_index")
+                    .put("timeField", "@timestamp")
+                    .put("logFieldName", "message")
+                    .put("selectionTimeRangeStart", "2025-06-24 07:50:00")
+                    .put("selectionTimeRangeEnd", "2025-06-24 07:55:00")
+                    .build(),
+                ActionListener.<String>wrap(response -> {
+                    JsonElement result = gson.fromJson(response, JsonElement.class);
+                    assertTrue(result.getAsJsonObject().has("logInsights"));
+                    assertTrue(result.getAsJsonObject().has("histogram"));
+                    assertTrue(result.getAsJsonObject().has("histogramInterval"));
+                    assertEquals(0, result.getAsJsonObject().getAsJsonArray("histogram").size());
+                    assertEquals(1, result.getAsJsonObject().getAsJsonArray("logInsights").size());
+                }, e -> fail("Tool execution failed: " + e.getMessage()))
+            );
+    }
+
+    @Test
+    @SneakyThrows
+    public void testLogInsightHistogramFailureFallback() {
+        String pplResponse =
+            """
+                {"schema":[{"name":"patterns_field","type":"string"},{"name":"pattern_count","type":"long"},{"name":"sample_logs","type":"array"}],
+                "datarows":[["Error in processing <*>",5,["Error in processing request","Error in processing data"]]],
+                "total":1,"size":1}
+                """;
+
+        // First call succeeds (pattern query), second call fails (histogram query)
+        AtomicReference<Integer> callCount = new AtomicReference<>(0);
+        doAnswer(invocation -> {
+            ActionListener<TransportPPLQueryResponse> listener = (ActionListener<TransportPPLQueryResponse>) invocation.getArguments()[2];
+            int count = callCount.updateAndGet(c -> c + 1);
+            if (count == 1) {
+                when(pplQueryResponse.getResult()).thenReturn(pplResponse);
+                listener.onResponse(pplQueryResponse);
+            } else {
+                listener.onFailure(new Exception("Histogram query failed"));
+            }
+            return null;
+        }).when(client).execute(eq(PPLQueryAction.INSTANCE), any(), any());
+
+        LogPatternAnalysisTool tool = LogPatternAnalysisTool.Factory.getInstance().create(params);
+
+        tool
+            .run(
+                ImmutableMap
+                    .<String, String>builder()
+                    .put("index", "test_index")
+                    .put("timeField", "@timestamp")
+                    .put("logFieldName", "message")
+                    .put("selectionTimeRangeStart", "2025-06-24 07:50:00")
+                    .put("selectionTimeRangeEnd", "2025-06-24 07:55:00")
+                    .build(),
+                ActionListener.<String>wrap(response -> {
+                    JsonElement result = gson.fromJson(response, JsonElement.class);
+                    // Should still return logInsights even when histogram fails
+                    assertTrue(result.getAsJsonObject().has("logInsights"));
+                    assertTrue(result.getAsJsonObject().has("histogram"));
+                    assertEquals(0, result.getAsJsonObject().getAsJsonArray("histogram").size());
+                }, e -> fail("Tool execution should not fail when only histogram fails: " + e.getMessage()))
             );
     }
 
