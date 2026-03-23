@@ -831,7 +831,7 @@ public class LogPatternAnalysisTool implements Tool {
         String filterClause = Strings.isEmpty(filter) ? "" : String.format(Locale.ROOT, " | where %s", filter);
 
         String pplTemplate = "source={INDEX} | where {TIME_FIELD}>'{START_TIME}' and {TIME_FIELD}<'{END_TIME}'{FILTER} "
-            + "| fields {LOG_FIELD} | patterns {LOG_FIELD} method=brain mode=aggregation variable_count_threshold=3 "
+            + "| head " + MAX_LOG_SAMPLE_SIZE + " | fields {LOG_FIELD} | patterns {LOG_FIELD} method=brain mode=aggregation variable_count_threshold=3 "
             + "| fields pattern_count, patterns_field";
 
         return pplTemplate
