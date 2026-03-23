@@ -253,10 +253,18 @@ public class LogPatternAnalysisTool implements Tool {
     private String version;
     private Client client;
     private ClusteringHelper clusteringHelper;
+    private int maxLogSampleSize = MAX_LOG_SAMPLE_SIZE;
 
-    public LogPatternAnalysisTool(Client client) {
+    public LogPatternAnalysisTool(Client client, Map<String, Object> config) {
         this.client = client;
         this.clusteringHelper = new ClusteringHelper(LOG_VECTORS_CLUSTERING_THRESHOLD);
+        if (config.containsKey("maxLogSampleSize")) {
+            try {
+                this.maxLogSampleSize = Double.valueOf(config.get("maxLogSampleSize").toString()).intValue();
+            } catch (Exception ex) {
+                // ignore
+            }
+        }
     }
 
     @Override
@@ -987,8 +995,7 @@ public class LogPatternAnalysisTool implements Tool {
 
         @Override
         public LogPatternAnalysisTool create(Map<String, Object> map) {
-
-            return new LogPatternAnalysisTool(client);
+            return new LogPatternAnalysisTool(client, map);
         }
 
         @Override
